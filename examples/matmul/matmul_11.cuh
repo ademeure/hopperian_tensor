@@ -439,7 +439,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 				int x_wg = x % 64;
 				int idx_x_32b = (x_wg % 16) / 8 + (x_wg / 16) * 32 * 4;
 				int y = ((threadIdx.x % 128) / 8) * 2;
-				bf16* block_Cx = &block_C[x];
 				
         int p = 0;
         int qidx = 0;
@@ -541,7 +540,7 @@ if (run_output) {
 // Baseline Output Path 32-bit loads (column/M-major)
 ///////////
 for (int n = 0; n < 256; n += 32, y += 32) {
- bf16* block_C_thread = &block_Cx[y*M];
+ bf16* block_C_thread = &block_C[x + y*M];
  int4* block_C_thread_128b = (int4*)block_C_thread;
  bf16 data_bf16_col0[8], data_bf16_col1[8]; 
  int idx_32b = idx_x_32b + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
@@ -588,7 +587,7 @@ asm volatile("bar.sync 1, 256;\n");
 // Baseline Output Path 32-bit loads (column/M-major)
 ///////////
 for (int n = 0; n < 256; n += 32, y += 32) {
- bf16* block_C_thread = &block_Cx[y*M];
+ bf16* block_C_thread = &block_C[x + y*M];
  int4* block_C_thread_128b = (int4*)block_C_thread;
  bf16 data_bf16_col0[8], data_bf16_col1[8]; 
  int idx_32b = idx_x_32b + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
