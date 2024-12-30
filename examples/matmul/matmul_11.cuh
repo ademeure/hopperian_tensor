@@ -528,24 +528,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                 if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
             }
 
-            asm volatile("cp.async.bulk.wait_group 0;");
-
-            int lane = tid % 32, warp = tid / 32;
-            int row = warp*16 + lane / 4;
-
-//asm volatile("bar.sync 1, 256;\n");
-
-            #pragma unroll
-            for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
- for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
-  bf16 out_bf16[8];
-  for (int k = 0; k < 8; k++) {
-   out_bf16[k] = d[m_it][n_tile][k];
-  }
-  int4* out_128b = (int4*)out_bf16;
-  block_sC_128b[tid + (n_tile + m_it * 16) * 128] = *out_128b;
- }
- }
 if (run_output) {
 ///////////
 // Baseline Output Path 32-bit loads (column/M-major)
@@ -573,6 +555,25 @@ int x_wg = x % 64;
  block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
 }
 }
+
+            asm volatile("cp.async.bulk.wait_group 0;");
+
+            int lane = tid % 32, warp = tid / 32;
+            int row = warp*16 + lane / 4;
+
+asm volatile("bar.sync 1, 256;\n");
+
+            #pragma unroll
+            for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+ for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
+  bf16 out_bf16[8];
+  for (int k = 0; k < 8; k++) {
+   out_bf16[k] = d[m_it][n_tile][k];
+  }
+  int4* out_128b = (int4*)out_bf16;
+  block_sC_128b[tid + (n_tile + m_it * 16) * 128] = *out_128b;
+ }
+ }
 
 run_output = true;
 
