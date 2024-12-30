@@ -1,4 +1,4 @@
-#include <cuda.h>
+include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda/barrier>
 #include <cublas_v2.h>
@@ -26,7 +26,7 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
   }
 }
 #define cudaCheck(err) (cudaCheck(err, __FILE__, __LINE__))
-
+/*
 #include "examples/matmul/matmul_1.cuh"
 #include "examples/matmul/matmul_2.cuh"
 #include "examples/matmul/matmul_3.cuh"
@@ -35,6 +35,7 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 #include "examples/matmul/matmul_6.cuh"
 #include "examples/matmul/matmul_7.cuh"
 #include "examples/matmul/matmul_8.cuh"
+*/
 #include "examples/matmul/matmul_9.cuh"
 #include "examples/matmul/matmul_10.cuh"
 #include "examples/matmul/matmul_11.cuh"
@@ -57,7 +58,7 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
   switch (kernel_num) {
     case 0:
       runCublasGemmBF16(M, N, K, A, B, C);
-      break;
+      break;/*
     case 1:
       runKernel1(M, N, K, A, B, C);
       break;
@@ -81,7 +82,7 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
       break;
     case 8:
       runKernel8(M, N, K, A, B, C, DB);
-      break;
+      break;*/
     case 9:
       runKernel9(M, N, K, A, B, C, DB);
       break;
@@ -132,7 +133,7 @@ int main() {
   cudaEventCreate(&start);
   cudaEventCreate(&stop);
 
-  long max_size = 8192;
+  long max_size = 16384;
   long m = max_size, n = max_size, k = max_size;
 
   bf16 *A = nullptr, *B = nullptr, *C = nullptr,
@@ -165,7 +166,7 @@ int main() {
 
   int repeat_times = 8;
   bool run_verif = true;
-  for (int kernel_num : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}) {
+  for (int kernel_num : {11, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}) {
     // for (int kernel_num : {0, 11}) {
     // Give the GPU some rest to avoid thermal throttling
     sleep(5);
@@ -173,7 +174,7 @@ int main() {
     // Verify against cuBLAS. Also serves as a warmup step.
     if (run_verif) {
       memset(C, 0, sizeof(bf16) * max_size * max_size);
-      cudaCheck(cudaMemcpy(dC, C, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
+              cudaCheck(cudaMemcpy(dC, C, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
       cudaCheck(cudaMemcpy(dC_ref, C, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
       memset(DB, ~0, sizeof(int) * max_size * 128);
       cudaCheck(cudaMemcpy(dDB, DB, sizeof(int) * max_size * 128,
