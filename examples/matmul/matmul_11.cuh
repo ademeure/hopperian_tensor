@@ -433,6 +433,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         bf16* block_sC = sC + wg_idx*B_WG_M*BN;
         int4* block_sC_128b = (int4*)block_sC;
         int* block_sC_32b = (int*)block_sC;
+				bf16 *block_C = C;
 
         int p = 0;
         int qidx = 0;
@@ -481,8 +482,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 									///////////
 									int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
 									int y = ((threadIdx.x % 128) / 8) * 2;
-									
-									bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
 									
 									//for (int n = 0; n < 256; n += 32, y += 32) {
 									y += (block_k_iter - 1) * 32;
@@ -550,6 +549,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 
 run_output = true;
 asm volatile("bar.sync 1, 256;\n");
+block_C = C + num_block_n*BN*M + num_block_m*BM;
 schedule_next = schedule.next(num_block_m, num_block_n);
 if (!schedule_next) {
 
@@ -559,8 +559,6 @@ if (!schedule_next) {
 int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
 //int x = ((threadIdx.x % 8) * 8);
 int y = ((threadIdx.x % 128) / 8) * 2;
-
-bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
 
 for (int n = 0; n < 256; n += 32, y += 32) {
  bf16* block_C_thread = &block_C[x + y*M];
