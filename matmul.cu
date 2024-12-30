@@ -1,4 +1,4 @@
-include <cuda.h>
+#include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda/barrier>
 #include <cublas_v2.h>
