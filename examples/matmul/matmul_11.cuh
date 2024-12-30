@@ -435,6 +435,10 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         int* block_sC_32b = (int*)block_sC;
 				bf16 *block_C = C;
 
+				int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
+				int y = ((threadIdx.x % 128) / 8) * 2;
+				int x_wg = x % 64;
+
         int p = 0;
         int qidx = 0;
 				bool run_output = false;
@@ -532,18 +536,15 @@ if (run_output) {
 ///////////
 // Baseline Output Path 32-bit loads (column/M-major)
 ///////////
-int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
-//int x = ((threadIdx.x % 8) * 8);
-int y = ((threadIdx.x % 128) / 8) * 2;
 
+#pragma unroll
 for (int n = 0; n < 256; n += 32, y += 32) {
  bf16* block_C_thread = &block_C[x + y*M];
  int4* block_C_thread_128b = (int4*)block_C_thread;
  bf16 data_bf16_col0[8];
  bf16 data_bf16_col1[8]; 
-int x_wg = x % 64;
-// int idx_32b = ((y / 8) % 2) * 2 + (y / 16) * 4 * 128 + (x % 8) * 4 * 4 + (x / 16) * 32 * 4;
- int idx_32b = (x_wg % 16) / 8 + (x_wg / 16) * 32 * 4 + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
+
+ int idx_32b = ((x_wg % 16) / 8 + (x_wg / 16) * 32 * 4) + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
 
  for(int k = 0; k < 8; k++) {
   int data = block_sC_32b[idx_32b];
@@ -584,18 +585,13 @@ asm volatile("bar.sync 1, 256;\n");
 ///////////
 // Baseline Output Path 32-bit loads (column/M-major)
 ///////////
-int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
-//int x = ((threadIdx.x % 8) * 8);
-int y = ((threadIdx.x % 128) / 8) * 2;
-
+#pragma unroll
 for (int n = 0; n < 256; n += 32, y += 32) {
  bf16* block_C_thread = &block_C[x + y*M];
  int4* block_C_thread_128b = (int4*)block_C_thread;
  bf16 data_bf16_col0[8];
  bf16 data_bf16_col1[8]; 
-int x_wg = x % 64;
-// int idx_32b = ((y / 8) % 2) * 2 + (y / 16) * 4 * 128 + (x % 8) * 4 * 4 + (x / 16) * 32 * 4;
- int idx_32b = (x_wg % 16) / 8 + (x_wg / 16) * 32 * 4 + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
+ int idx_32b = ((x_wg % 16) / 8 + (x_wg / 16) * 32 * 4) + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
 
  for(int k = 0; k < 8; k++) {
   int data = block_sC_32b[idx_32b];
