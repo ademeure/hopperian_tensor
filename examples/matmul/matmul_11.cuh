@@ -342,7 +342,7 @@ struct SMem {
 
 
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
-__global__  __launch_bounds__(384) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel11(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel11(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 3;
     constexpr int B_WG_M = BM / num_consumers;
@@ -383,8 +383,7 @@ __global__  __launch_bounds__(384) void  __cluster_dims__(CLUSTER_M * CLUSTER_N,
 
     // Producer
     if (wg_idx == 0) {
-        constexpr int num_regs = (num_consumers <= 2 ? 24 : 32);
-        warpgroup_reg_dealloc<num_regs>();
+        warpgroup_reg_dealloc<32>();
         if (tid == 0) {
             int p = 0;
             int qidx = 0;
@@ -422,8 +421,7 @@ __global__  __launch_bounds__(384) void  __cluster_dims__(CLUSTER_M * CLUSTER_N,
             }
         }
     } if (wg_idx >= 3) {
-				constexpr int num_regs = 32;
-        warpgroup_reg_alloc<num_regs>();
+        warpgroup_reg_dealloc<32>();
 				wg_idx -= 3;
 
 				int num_block_m, num_block_n;
@@ -465,8 +463,7 @@ __global__  __launch_bounds__(384) void  __cluster_dims__(CLUSTER_M * CLUSTER_N,
 					}
 				}
 			} else {
-        constexpr int num_regs = (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
-        warpgroup_reg_alloc<num_regs>();
+        warpgroup_reg_alloc<208>();
         float d[B_WG_M/WGMMA_M][WGMMA_N/16][8];
         --wg_idx;
         for (int qidx = 0; qidx < QSIZE; ++qidx) {
