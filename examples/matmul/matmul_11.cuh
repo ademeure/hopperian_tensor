@@ -344,7 +344,7 @@ struct SMem {
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
 __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel11(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
-    constexpr int num_consumers = (NUM_THREADS / 128) - 1;
+    constexpr int num_consumers = (NUM_THREADS / 128) - 3;
     constexpr int B_WG_M = BM / num_consumers;
     constexpr int CLUSTERS = CLUSTER_M * CLUSTER_N;
     assert((M / BM) % CLUSTER_M == 0);
