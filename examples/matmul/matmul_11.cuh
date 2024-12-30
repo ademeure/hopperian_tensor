@@ -432,7 +432,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         int p = 0;
         int qidx = 0;
         int num_block_m, num_block_n;
-        while (schedule.next(num_block_m, num_block_n);) {
+        while (schedule.next(num_block_m, num_block_n)) {
             num_block_n = num_block_n * CLUSTER_N + rank_n;
             num_block_m = num_block_m * CLUSTER_M + rank_m;
             {
