@@ -471,12 +471,11 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                     }
                 }
                 warpgroup_commit_batch();
-            }
-            for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter) {
                 warpgroup_wait();
                 if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
                 ++qidx;
-
+            }
+            for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
 								/*if (false && run_output && (block_k_iter % 8) == 0) {
 									///////////
 									// Baseline Output Path 32-bit loads (column/M-major)
@@ -525,6 +524,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                     }
                 }
                 warpgroup_commit_batch();
+                warpgroup_wait();
+                if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
             }
 
 if (run_output) {
@@ -554,8 +555,6 @@ int x_wg = x % 64;
  block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
 }
 }
-                warpgroup_wait();
-                if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
 
             asm volatile("cp.async.bulk.wait_group 0;");
 
