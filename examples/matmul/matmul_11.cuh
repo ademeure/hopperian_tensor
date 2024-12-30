@@ -431,8 +431,10 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         }
         int p = 0;
         int qidx = 0;
+				bool run_output = false;
         int num_block_m, num_block_n;
-        while (schedule.next(num_block_m, num_block_n)) {
+				bool schedule_next = schedule.next(num_block_m, num_block_n);
+        while (schedule_next) {
             num_block_n = num_block_n * CLUSTER_N + rank_n;
             num_block_m = num_block_m * CLUSTER_M + rank_m;
             {
@@ -468,6 +470,38 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                 ++qidx;
             }
             for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
+								if (run_output) {
+									///////////
+									// Baseline Output Path 32-bit loads (column/M-major)
+									///////////
+									int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
+									int y = ((threadIdx.x % 128) / 8) * 2;
+									
+									bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
+									
+									//for (int n = 0; n < 256; n += 32, y += 32) {
+									y += (block_k_iter - 1) * 32;
+									 bf16* block_C_thread = &block_C[x + y*M];
+									 int4* block_C_thread_128b = (int4*)block_C_thread;
+									 bf16 data_bf16_col0[8];
+									 bf16 data_bf16_col1[8]; 
+									int x_wg = x % 64;
+									 int idx_32b = (x_wg % 16) / 8 + (x_wg / 16) * 32 * 4 + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
+									
+									 for(int k = 0; k < 8; k++) {
+									  int data = block_sC_32b[idx_32b];
+									  data_bf16_col0[k] = ((bf16*)&data)[0];
+									  data_bf16_col1[k] = ((bf16*)&data)[1];
+									  idx_32b += 4 * 4;
+									 }
+									 *block_C_thread_128b = *((int4*)data_bf16_col0);
+									 block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
+
+									if (block_k_iter == 8) {
+									 run_output = false;
+									}
+								}
+
                 if (qidx == QSIZE) {qidx = 0; p ^= 1; };
                 wait(&full[qidx], p);
                 warpgroup_arrive();
@@ -513,9 +547,10 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
  }
  }
 
+run_output = true:
 asm volatile("bar.sync 1, 256;\n");
-
-if (true) {
+schedule_next = schedule.next(num_block_m, num_block_n);
+if (!schedule_next) {
 
 ///////////
 // Baseline Output Path 32-bit loads (column/M-major)
