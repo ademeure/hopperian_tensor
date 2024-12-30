@@ -429,6 +429,11 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
         for (int qidx = 0; qidx < QSIZE; ++qidx) {
             if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
         }
+
+        bf16* block_sC = sC + wg_idx*B_WG_M*BN;
+        int4* block_sC_128b = (int4*)block_sC;
+        int* block_sC_32b = (int*)block_sC;
+
         int p = 0;
         int qidx = 0;
 				bool run_output = false;
@@ -531,10 +536,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 
 //asm volatile("bar.sync 1, 256;\n");
 
-
-            bf16* block_sC = sC + wg_idx*B_WG_M*BN;
-            int4* block_sC_128b = (int4*)block_sC;
-            int* block_sC_32b = (int*)block_sC;
             #pragma unroll
             for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
  for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
@@ -547,7 +548,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
  }
  }
 
-run_output = true:
+run_output = true;
 asm volatile("bar.sync 1, 256;\n");
 schedule_next = schedule.next(num_block_m, num_block_n);
 if (!schedule_next) {
