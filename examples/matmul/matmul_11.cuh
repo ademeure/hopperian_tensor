@@ -431,6 +431,10 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
           num_block_n = num_block_n * CLUSTER_N + rank_n;
           num_block_m = num_block_m * CLUSTER_M + rank_m;
 
+          bf16* block_sC = sC + wg_idx*B_WG_M*BN;
+          int4* block_sC_128b = (int4*)block_sC;
+          int* block_sC_32b = (int*)block_sC;
+
 					asm volatile("bar.sync 7, 512;\n");
 
 					///////////
