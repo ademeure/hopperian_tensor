@@ -340,8 +340,9 @@ struct SMem {
     int space[SPACE_LEN];
 };
 
+
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTER_M, int CLUSTER_N>
-__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel11(int M, int N, int K, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CLUSTER_N, 1, 1) matmulKernel11(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, int* dspace) {
     constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1;
     constexpr int B_WG_M = BM / num_consumers;
@@ -494,6 +495,62 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
             int lane = tid % 32, warp = tid / 32;
             int row = warp*16 + lane / 4;
 
+//asm volatile("bar.sync 1, 256;\n");
+
+
+            bf16* block_sC = sC + wg_idx*B_WG_M*BN;
+            int4* block_sC_128b = (int4*)block_sC;
+            int* block_sC_32b = (int*)block_sC;
+            #pragma unroll
+            for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+ for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
+  bf16 out_bf16[8];
+  for (int k = 0; k < 8; k++) {
+   out_bf16[k] = d[m_it][n_tile][k];
+  }
+  int4* out_128b = (int4*)out_bf16;
+  block_sC_128b[tid + (n_tile + m_it * 16) * 128] = *out_128b;
+ }
+ }
+
+asm volatile("bar.sync 1, 256;\n");
+
+if(threadIdx.x < 384) {
+
+///////////
+// Baseline Output Path 32-bit loads (column/M-major)
+///////////
+int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
+//int x = ((threadIdx.x % 8) * 8);
+int y = ((threadIdx.x % 128) / 8) * 2;
+
+bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
+
+for (int n = 0; n < 256; n += 32, y += 32) {
+ bf16* block_C_thread = &block_C[x + y*M];
+ int4* block_C_thread_128b = (int4*)block_C_thread;
+ bf16 data_bf16_col0[8];
+ bf16 data_bf16_col1[8]; 
+int x_wg = x % 64;
+// int idx_32b = ((y / 8) % 2) * 2 + (y / 16) * 4 * 128 + (x % 8) * 4 * 4 + (x / 16) * 32 * 4;
+ int idx_32b = (x_wg % 16) / 8 + (x_wg / 16) * 32 * 4 + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
+
+ for(int k = 0; k < 8; k++) {
+  int data = block_sC_32b[idx_32b];
+  data_bf16_col0[k] = ((bf16*)&data)[0];
+  data_bf16_col1[k] = ((bf16*)&data)[1];
+  idx_32b += 4 * 4;
+ }
+ *block_C_thread_128b = *((int4*)data_bf16_col0);
+ block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
+}
+
+}
+
+asm volatile("bar.sync 1, 256;\n");
+
+
+                /*
             bf16* block_sC = sC + wg_idx*B_WG_M*BN;
             #pragma unroll
             for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
@@ -528,11 +585,12 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                 store_async(&tensorMapC, (bf16*)&sC[0], num_block_m*BM, num_block_n*BN);
                 asm volatile("cp.async.bulk.commit_group;");
             }
-        }
+*/ 
+       }
     }
 }
 
-// Rotate/flip quadrant appropriately
+// Rotate/flip quadrant ap      pr      opriately
 void rot(int n, int& x, int& y, int rx, int ry) {
     if (ry == 0) {
         if (rx == 1) {
@@ -630,10 +688,9 @@ void runKernel11(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
         kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
 
-    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, d_tma_map_C, d_tma_map_A, d_tma_map_B, _dspace);
+    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, C, d_tma_map_C, d_tma_map_A, d_tma_map_B, _dspace);
 }
     
 } // namespace M11
 
 using M11::runKernel11;
-    
