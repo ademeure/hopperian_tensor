@@ -598,8 +598,8 @@ int oldn = num_block_n;
 schedule_next = schedule.next(num_block_m, num_block_n);
 
 if(!schedule_next) {
-num_block_m = old_m;
-num_block_n = old_n;
+num_block_m = oldm;
+num_block_n = oldn;
 
 bf16* block_sC = sC + wg_idx*B_WG_M*BN;
           int4* block_sC_128b = (int4*)block_sC;
