@@ -476,7 +476,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                 ++qidx;
             }
             for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
-								if (run_output) {
+								if (run_output && (block_k_iter % 8) == 0) {
 									///////////
 									// Baseline Output Path 32-bit loads (column/M-major)
 									///////////
@@ -484,7 +484,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 									int y = ((threadIdx.x % 128) / 8) * 2;
 									
 									//for (int n = 0; n < 256; n += 32, y += 32) {
-									y += (block_k_iter - 1) * 32;
+									y += ((block_k_iter - 8) / 8) * 32;
 									 bf16* block_C_thread = &block_C[x + y*M];
 									 int4* block_C_thread_128b = (int4*)block_C_thread;
 									 bf16 data_bf16_col0[8];
@@ -501,7 +501,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 									 *block_C_thread_128b = *((int4*)data_bf16_col0);
 									 block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
 
-									if (block_k_iter == 8) {
+									if (block_k_iter == 64) {
 									 run_output = false;
 									}
 								}
