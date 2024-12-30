@@ -469,7 +469,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
             }
             for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
 
-								if (!first && block_k_iter <= 8) {
+								if (false && !first && block_k_iter <= 8) {
 				          bf16* block_sC = sC + wg_idx*B_WG_M*BN;
 				          int4* block_sC_128b = (int4*)block_sC;
 				          int* block_sC_32b = (int*)block_sC;
@@ -555,7 +555,7 @@ asm volatile("bar.sync 1, 256;\n");
 
 schedule_next = schedule.next(num_block_m, num_block_n);
 
-if(!schedule_next) {
+if(false && !schedule_next) {
 
 bf16* block_sC = sC + wg_idx*B_WG_M*BN;
           int4* block_sC_128b = (int4*)block_sC;
