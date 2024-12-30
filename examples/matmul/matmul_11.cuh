@@ -518,7 +518,7 @@ asm volatile("bar.sync 1, 256;\n");
 
 schedule_next = schedule.next(num_block_m, num_block_n);
 
-if (schedule_next) {
+if (true) {
 
 ///////////
 // Baseline Output Path 32-bit loads (column/M-major)
