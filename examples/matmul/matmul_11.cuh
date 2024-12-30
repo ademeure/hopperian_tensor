@@ -476,7 +476,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                 ++qidx;
             }
             for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
-								if (run_output && (block_k_iter % 8) == 0) {
+								if (false && run_output && (block_k_iter % 8) == 0) {
 									///////////
 									// Baseline Output Path 32-bit loads (column/M-major)
 									///////////
