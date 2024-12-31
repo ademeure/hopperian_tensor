@@ -427,8 +427,12 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 		            num_block_m = num_block_m * CLUSTER_M + rank_m;
 	
 								asm volatile("bar.sync 1, 320;\n");
+
+								if (num_block_m != 0 || num_block_n != 0) {
+									continue;
+								}
 	
-								for(int fakeid = threadIdx.x % 64; fakeid < 32; fakeid += 64) {
+								for(int fakeid = threadIdx.x % 64; fakeid < 256; fakeid += 64) {
 									wg_idx = fakeid / 128;
 									
 					        bf16* block_sC = sC + wg_idx*B_WG_M*BN;
