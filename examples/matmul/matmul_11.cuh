@@ -420,7 +420,48 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                     }
                 }
             }
-        }
+        } else if (threadIdx.x >= 64) {
+						int num_block_m, num_block_n;
+		        while (schedule.next(num_block_m, num_block_n)) {
+		            num_block_n = num_block_n * CLUSTER_N + rank_n;
+		            num_block_m = num_block_m * CLUSTER_M + rank_m;
+	
+								asm volatile("bar.sync 1, 320;\n");
+	
+								for(int fakeid = threadIdx.x % 64; fakeid < 256; fakeid += 64) {
+									wg_idx = fakeid / 128;
+									
+					        bf16* block_sC = sC + wg_idx*B_WG_M*BN;
+					        int4* block_sC_128b = (int4*)block_sC;
+					        int* block_sC_32b = (int*)block_sC;
+									bf16 *block_C = C + num_block_n*BN*M + num_block_m*BM;
+		
+									///////////
+									// Baseline Output Path 32-bit loads (column/M-major)
+									///////////
+									int x = ((fakeid % 8) * 8) + wg_idx * 64;
+									int y = ((fakeid % 128) / 8) * 2;
+									
+									for (int n = 0; n < 256; n += 32, y += 32) {
+									 bf16* block_C_thread = &block_C[x + y*M];
+									 int4* block_C_thread_128b = (int4*)block_C_thread;
+									 bf16 data_bf16_col0[8];
+									 bf16 data_bf16_col1[8]; 
+									 int x_wg = x % 64;
+									 int idx_32b = ((x_wg % 16) / 8 + (x_wg / 16) * 32 * 4) + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
+									
+									 for(int k = 0; k < 8; k++) {
+									  int data = block_sC_32b[idx_32b];
+									  data_bf16_col0[k] = ((bf16*)&data)[0];
+									  data_bf16_col1[k] = ((bf16*)&data)[1];
+									  idx_32b += 4 * 4;
+									 }
+									 *block_C_thread_128b = *((int4*)data_bf16_col0);
+									 block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
+									}
+							}
+					}
+			}
     } else {
         constexpr int num_regs = (num_consumers == 1 ? 256 : (num_consumers == 2 ? 240 : 160));
         warpgroup_reg_alloc<num_regs>();
@@ -476,36 +517,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                 ++qidx;
             }
             for (int block_k_iter = 1; block_k_iter < num_blocks_k; ++block_k_iter, ++qidx) {
-								/*if (false && run_output && (block_k_iter % 8) == 0) {
-									///////////
-									// Baseline Output Path 32-bit loads (column/M-major)
-									///////////
-									int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
-									int y = ((threadIdx.x % 128) / 8) * 2;
-									
-									//for (int n = 0; n < 256; n += 32, y += 32) {
-									y += ((block_k_iter - 8) / 8) * 32;
-									 bf16* block_C_thread = &block_C[x + y*M];
-									 int4* block_C_thread_128b = (int4*)block_C_thread;
-									 bf16 data_bf16_col0[8];
-									 bf16 data_bf16_col1[8]; 
-									int x_wg = x % 64;
-									 int idx_32b = (x_wg % 16) / 8 + (x_wg / 16) * 32 * 4 + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
-									
-									 for(int k = 0; k < 8; k++) {
-									  int data = block_sC_32b[idx_32b];
-									  data_bf16_col0[k] = ((bf16*)&data)[0];
-									  data_bf16_col1[k] = ((bf16*)&data)[1];
-									  idx_32b += 4 * 4;
-									 }
-									 *block_C_thread_128b = *((int4*)data_bf16_col0);
-									 block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
-
-									if (block_k_iter == 64) {
-									 run_output = false;
-									}
-								}*/
-
                 if (qidx == QSIZE) {qidx = 0; p ^= 1; };
                 wait(&full[qidx], p);
                 warpgroup_arrive();
@@ -528,126 +539,51 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                 if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
             }
 
-if (run_output) {
-///////////
-// Baseline Output Path 32-bit loads (column/M-major)
-///////////
-int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
-//int x = ((threadIdx.x % 8) * 8);
-int y = ((threadIdx.x % 128) / 8) * 2;
-
-for (int n = 0; n < 256; n += 32, y += 32) {
- bf16* block_C_thread = &block_C[x + y*M];
- int4* block_C_thread_128b = (int4*)block_C_thread;
- bf16 data_bf16_col0[8];
- bf16 data_bf16_col1[8]; 
-int x_wg = x % 64;
-// int idx_32b = ((y / 8) % 2) * 2 + (y / 16) * 4 * 128 + (x % 8) * 4 * 4 + (x / 16) * 32 * 4;
- int idx_32b = ((x_wg % 16) / 8 + (x_wg / 16) * 32 * 4) + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
-
- for(int k = 0; k < 8; k++) {
-  int data = block_sC_32b[idx_32b];
-  data_bf16_col0[k] = ((bf16*)&data)[0];
-  data_bf16_col1[k] = ((bf16*)&data)[1];
-  idx_32b += 4 * 4;
- }
- *block_C_thread_128b = *((int4*)data_bf16_col0);
- block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
-}
-}
+						if (false) {
+							///////////
+							// Baseline Output Path 32-bit loads (column/M-major)
+							///////////
+							int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
+							int y = ((threadIdx.x % 128) / 8) * 2;
+							
+							for (int n = 0; n < 256; n += 32, y += 32) {
+							 bf16* block_C_thread = &block_C[x + y*M];
+							 int4* block_C_thread_128b = (int4*)block_C_thread;
+							 bf16 data_bf16_col0[8];
+							 bf16 data_bf16_col1[8]; 
+							 int x_wg = x % 64;
+							 int idx_32b = ((x_wg % 16) / 8 + (x_wg / 16) * 32 * 4) + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
+							
+							 for(int k = 0; k < 8; k++) {
+							  int data = block_sC_32b[idx_32b];
+							  data_bf16_col0[k] = ((bf16*)&data)[0];
+							  data_bf16_col1[k] = ((bf16*)&data)[1];
+							  idx_32b += 4 * 4;
+							 }
+							 *block_C_thread_128b = *((int4*)data_bf16_col0);
+							 block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
+							}
+						}
 
             asm volatile("cp.async.bulk.wait_group 0;");
-
             int lane = tid % 32, warp = tid / 32;
             int row = warp*16 + lane / 4;
 
-asm volatile("bar.sync 1, 256;\n");
-
             #pragma unroll
             for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
- for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
-  bf16 out_bf16[8];
-  for (int k = 0; k < 8; k++) {
-   out_bf16[k] = d[m_it][n_tile][k];
-  }
-  int4* out_128b = (int4*)out_bf16;
-  block_sC_128b[tid + (n_tile + m_it * 16) * 128] = *out_128b;
- }
- }
+						 for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
+						  bf16 out_bf16[8];
+						  for (int k = 0; k < 8; k++) {
+						   out_bf16[k] = d[m_it][n_tile][k];
+						  }
+						  int4* out_128b = (int4*)out_bf16;
+						  block_sC_128b[tid + (n_tile + m_it * 16) * 128] = *out_128b;
+						 }
+					  }
 
-run_output = true;
+						asm volatile("bar.arrive 1, 320;\n");
 
-block_C = C + num_block_n*BN*M + num_block_m*BM;
-schedule_next = schedule.next(num_block_m, num_block_n);
-if (!schedule_next) {
-asm volatile("bar.sync 1, 256;\n");
-///////////
-// Baseline Output Path 32-bit loads (column/M-major)
-///////////
-int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
-//int x = ((threadIdx.x % 8) * 8);
-int y = ((threadIdx.x % 128) / 8) * 2;
-
-for (int n = 0; n < 256; n += 32, y += 32) {
- bf16* block_C_thread = &block_C[x + y*M];
- int4* block_C_thread_128b = (int4*)block_C_thread;
- bf16 data_bf16_col0[8];
- bf16 data_bf16_col1[8]; 
-int x_wg = x % 64;
-// int idx_32b = ((y / 8) % 2) * 2 + (y / 16) * 4 * 128 + (x % 8) * 4 * 4 + (x / 16) * 32 * 4;
- int idx_32b = ((x_wg % 16) / 8 + (x_wg / 16) * 32 * 4)  + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
-
- for(int k = 0; k < 8; k++) {
-  int data = block_sC_32b[idx_32b];
-  data_bf16_col0[k] = ((bf16*)&data)[0];
-  data_bf16_col1[k] = ((bf16*)&data)[1];
-  idx_32b += 4 * 4;
- }
- *block_C_thread_128b = *((int4*)data_bf16_col0);
- block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
-}
-
-}
-
-//asm volatile("bar.sync 1, 256;\n");
-
-
-                /*
-            bf16* block_sC = sC + wg_idx*B_WG_M*BN;
-            #pragma unroll
-            for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
-                int yo = m_it*WGMMA_M;
-                #pragma unroll
-                for (int w = 0; w < WGMMA_N; w+=16) {
-                    int col = w + 2*(tid % 4);
-                    #define ST(i, j, v) block_sC[(j)*B_WG_M + (i) + yo] = v
-                    
-                    ST(row, col, d[m_it][w/16][0]);
-                    ST(row+8, col, d[m_it][w/16][2]);
-                    
-                    
-                    ST(row, col+1, d[m_it][w/16][1]);
-                    ST(row+8, col+1, d[m_it][w/16][3]);
-                    
-                    
-                    ST(row, col+8, d[m_it][w/16][4]);
-                    ST(row+8, col+8, d[m_it][w/16][6]);
-                    
-                    
-                    ST(row, col+9, d[m_it][w/16][5]);
-                    ST(row+8, col+9, d[m_it][w/16][7]);
-                    
-                    #undef ST
-                }
-            }
-            // Wait for all 256 consumer threads to reach here
-            asm volatile("bar.sync 1, 256;\n");
-
-            if (threadIdx.x == 128) {
-                store_async(&tensorMapC, (bf16*)&sC[0], num_block_m*BM, num_block_n*BN);
-                asm volatile("cp.async.bulk.commit_group;");
-            }
-*/ 
+						schedule_next = schedule.next(num_block_m, num_block_n);
        }
     }
 }
