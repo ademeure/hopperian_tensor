@@ -512,6 +512,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                     }
                 }
                 warpgroup_commit_batch();
+								if (run_output) {
+									asm volatile("bar.arrive 1, 320;\n");
+								}
                 warpgroup_wait();
                 if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
                 ++qidx;
@@ -539,38 +542,13 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                 if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
             }
 
-						if (false) {
-							///////////
-							// Baseline Output Path 32-bit loads (column/M-major)
-							///////////
-							int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
-							int y = ((threadIdx.x % 128) / 8) * 2;
-							
-							for (int n = 0; n < 256; n += 32, y += 32) {
-							 bf16* block_C_thread = &block_C[x + y*M];
-							 int4* block_C_thread_128b = (int4*)block_C_thread;
-							 bf16 data_bf16_col0[8];
-							 bf16 data_bf16_col1[8]; 
-							 int x_wg = x % 64;
-							 int idx_32b = ((x_wg % 16) / 8 + (x_wg / 16) * 32 * 4) + (y % 8) * 4 / 2 + ((y / 8) % 2) * 2 + (y / 16) * 4 * 128;
-							
-							 for(int k = 0; k < 8; k++) {
-							  int data = block_sC_32b[idx_32b];
-							  data_bf16_col0[k] = ((bf16*)&data)[0];
-							  data_bf16_col1[k] = ((bf16*)&data)[1];
-							  idx_32b += 4 * 4;
-							 }
-							 *block_C_thread_128b = *((int4*)data_bf16_col0);
-							 block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
-							}
-						}
-
             asm volatile("cp.async.bulk.wait_group 0;");
             int lane = tid % 32, warp = tid / 32;
             int row = warp*16 + lane / 4;
 
             #pragma unroll
             for (int m_it = 0; m_it < B_WG_M/WGMMA_M; ++m_it) {
+						 #pragma unroll
 						 for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
 						  bf16 out_bf16[8];
 						  for (int k = 0; k < 8; k++) {
@@ -581,9 +559,11 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 						 }
 					  }
 
-						asm volatile("bar.arrive 1, 320;\n");
-
+						run_output = true;
 						schedule_next = schedule.next(num_block_m, num_block_n);
+						if(!schedule_next) {
+							asm volatile("bar.arrive 1, 320;\n");
+						}
        }
     }
 }
