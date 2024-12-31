@@ -426,7 +426,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 		            num_block_n = num_block_n * CLUSTER_N + rank_n;
 		            num_block_m = num_block_m * CLUSTER_M + rank_m;
 	
-								asm volatile("bar.sync 1, 320;\n");
+								asm volatile("bar.sync 11, 320;\n");
 
 								if (num_block_m != 0 || num_block_n != 0) {
 									continue;
@@ -516,9 +516,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
                     }
                 }
                 warpgroup_commit_batch();
-								if (run_output) {
-									asm volatile("bar.arrive 1, 320;\n");
-								}
+								//if (run_output) {
+								//asm volatile("bar.arrive 1, 320;\n");
+								//}
                 warpgroup_wait();
                 if (tid < CLUSTERS) arrive_cluster(&empty[qidx], tid);
                 ++qidx;
@@ -565,9 +565,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M * CL
 
 						run_output = true;
 						schedule_next = schedule.next(num_block_m, num_block_n);
-						if(!schedule_next) {
-							asm volatile("bar.arrive 1, 320;\n");
-						}
+						asm volatile("bar.arrive 11, 320;\n");
        }
     }
 }
