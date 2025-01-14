@@ -11,9 +11,9 @@
 #define SLEEP_BETWEEN_KERNELS_SEC 0
 #define REFERENCE_KERNEL 0
 constexpr bool RUN_VERIF = true;
-constexpr int max_size = 8192;
+constexpr int max_size = 16384;
 constexpr int prime = 3719;
-int repeat_times = 50;
+int repeat_times = 10;
 
 int get_time() {
   static int last_time = 0;

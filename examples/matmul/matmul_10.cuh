@@ -306,7 +306,7 @@ template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
     alignas(128) bf16 A[BM*BK*QSIZE];
     alignas(128) bf16 B[BK*BN*QSIZE];
-    alignas(128) bf16 C[BN*BM]; // TODO: should be /8 but doesn't work, needs debugging
+    alignas(128) bf16 C[BN*BM/8];
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
 };
 
@@ -391,7 +391,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                     #pragma unroll 2
                     for (int block_k_iter = 0; block_k_iter < num_blocks_k;) {
                         if constexpr (MINIMUM_K_ITERATIONS % QSIZE == 0) {
-                            p = 0, qidx = 0;
+                            qidx = 0;
                         }
                         #pragma unroll MINIMUM_K_ITERATIONS
                         for (int j = 0; j < MINIMUM_K_ITERATIONS; j++, block_k_iter++) {
@@ -411,7 +411,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                     #pragma unroll 2
                     for (int block_k_iter = 0; block_k_iter < num_blocks_k;) {
                         if constexpr (MINIMUM_K_ITERATIONS % QSIZE == 0) {
-                            p = 0, qidx = 0;
+                            qidx = 0;
                         }
                         #pragma unroll MINIMUM_K_ITERATIONS
                         for (int j = 0; j < MINIMUM_K_ITERATIONS; j++, block_k_iter++) {
@@ -439,7 +439,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
         float d[WGMMA_N/16][8];
         bf16 d_bf16[WGMMA_N/16][8];
 
-        bf16* block_sC = sC + wg_idx*(B_WG_M*BN/4);
+        bf16* block_sC = sC + wg_idx*B_WG_M*BN/8;
         int4* block_sC_128b = (int4*)block_sC;
         int* block_sC_32b = (int*)block_sC;
         bf16 *block_C = C;
@@ -610,7 +610,7 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     constexpr int BN = 256;
     constexpr int BK = 64;
     constexpr int NUM_THREADS = 128*3;
-    constexpr int QSIZE = 3; // TODO: need to get this working with 4
+    constexpr int QSIZE = 4;
     constexpr int CLUSTER_M = 2;
     constexpr int NUM_SM = 114; // H100 PCIe :(
     static_assert(NUM_SM % (CLUSTER_M) == 0);
