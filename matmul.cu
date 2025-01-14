@@ -11,9 +11,9 @@
 #define SLEEP_BETWEEN_KERNELS_SEC 0
 #define REFERENCE_KERNEL 0
 constexpr bool RUN_VERIF = true;
-constexpr int max_size = 16384;
+constexpr int max_size = 8192;
 constexpr int prime = 3719;
-int repeat_times = 10;
+int repeat_times = 50;
 
 int get_time() {
   static int last_time = 0;
@@ -133,7 +133,7 @@ void randomize_matrix(bf16 *mat, int N) {
   for (; i < prime; i++) {
     mat[i] = distribution(generator);
   }
-  printf("Pre-Memmove - time: %d\n", get_time());
+  //printf("Pre-Memmove - time: %d\n", get_time());
   //memmove(mat+9479, mat, sizeof(bf16) * (N-9479));
   for (int multiplier = 1; i < N-(prime * multiplier); i += prime * multiplier, multiplier *= 2) {
     memcpy(mat+i, mat, sizeof(bf16) * prime);
@@ -144,7 +144,7 @@ void randomize_matrix(bf16 *mat, int N) {
   for (; i < N; i++) {
     mat[i] = mat[i-prime];
   }
-  printf("Post-Duplication - time: %d\n", get_time());
+  //printf("Post-Duplication - time: %d\n", get_time());
 #endif
 #else
   cudaMemset(mat, 0, sizeof(bf16) * N);
@@ -187,7 +187,7 @@ __global__ void warmupKernel() {
 int main() {
   get_time();
   //warmupKernel<<<32, 32>>>();
-  printf("Warmed up - time: %d\n", get_time());
+  //printf("Warmed up - time: %d\n", get_time());
   long m = max_size, n = max_size, k = max_size;
 
   bf16 *A = nullptr, *B = nullptr, *C = nullptr, *C_ref = nullptr;  // host matriceRas
@@ -201,11 +201,11 @@ int main() {
   C_ref = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
   DB = (int *)malloc(sizeof(int) * max_size * 128);
 
-  printf("Randomizing matrices - time: %d\n", get_time());
+  //printf("Randomizing matrices - time: %d\n", get_time());
   randomize_matrix(A, max_size * max_size);
   randomize_matrix(B, max_size * max_size);
   randomize_matrix(C, max_size * max_size);
-  printf("Randomized matrices - time: %d\n", get_time());
+  //printf("Randomized matrices - time: %d\n", get_time());
 
   int* result;
   int result_host;
@@ -216,15 +216,15 @@ int main() {
   cudaCheck(cudaMalloc((void **)&dC, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(bf16) * max_size * max_size));
 
-  printf("Post-Malloc - time: %d\n", get_time());
+  //printf("Post-Malloc - time: %d\n", get_time());
 
   cudaCheck(cudaMemcpyAsync(dA, A, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
   cudaCheck(cudaMemcpyAsync(dB, B, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
-  printf("Post-Memcpy - time: %d\n", get_time());
+  //printf("Post-Memcpy - time: %d\n", get_time());
 
 #ifdef ENABLE_CUBLAS
   cublasCreate(&cublas_handle);
-  printf("Cublas created - time: %d\n", get_time());
+  //printf("Cublas created - time: %d\n", get_time());
 #endif
 
   timespec ts_second;
@@ -238,7 +238,7 @@ int main() {
 
   bool first_run = true;
   bool run_verif = RUN_VERIF;
-  printf("Verifying kernels - time: %d\n", get_time());
+  //printf("Verifying kernels - time: %d\n", get_time());
   for (int kernel_num : {10}) {
     printf("\nKERNEL %d\n", kernel_num);
 
