@@ -525,10 +525,14 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                 if (++qidx == QSIZE) {qidx = 0; p ^= 1; };
             }
 
+            output_to_gmem = true;
+            block_C = C + num_block_n*BN*M + num_block_m*BM;
+            schedule_next = schedule.next(num_block_m, num_block_n);
+
             warpgroup_wait<DELAYED_WAIT>();
             if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(old_qidx), tid);
 
-            if (DELAYED_WAIT > 0) {
+            if constexpr (DELAYED_WAIT > 0) {
                 warpgroup_wait<0>();
                 for (int i = 1; i <= DELAYED_WAIT; i++) {
                     old_qidx = (old_qidx + 1) % QSIZE;
@@ -541,10 +545,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                     d_bf16[n_tile][k] = (bf16)d[n_tile][k];
                 }
             }
-
-            output_to_gmem = true;
-            block_C = C + num_block_n*BN*M + num_block_m*BM;
-            schedule_next = schedule.next(num_block_m, num_block_n);
 
             // on the last iteration, we can't overlap the global memory writes with the matmuls, so do it immediately
             if (!schedule_next) {
@@ -586,7 +586,7 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     constexpr int CLUSTER_M = 2;
     constexpr int NUM_SM = 114; // H100 PCIe :(
     static_assert(NUM_SM % (CLUSTER_M) == 0);
-    static_assert(K >= 8 * BK, "K must be >= 8*BK (512 for BK=64)");
+    assert(K >= 8 * BK, "K must be >= 8*BK (512 for BK=64)");
 
     if (_prev_m != M || _prev_n != N || _prev_k != K) {
         d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
