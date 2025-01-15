@@ -92,38 +92,6 @@ __device__ __forceinline__ void wgmma256(float d[16][8], uint64_t desc_a, uint64
             "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
 }
 
-template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-__device__ __forceinline__ void wgmma128(float d[8][8], uint64_t desc_a, uint64_t desc_b) {
-    asm volatile(
-        "{\n"
-        "wgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 "
-        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
-        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
-        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
-        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31,  "
-        " %32,  %33,  %34,  %35,  %36,  %37,  %38,  %39,  "
-        " %40,  %41,  %42,  %43,  %44,  %45,  %46,  %47,  "
-        " %48,  %49,  %50,  %51,  %52,  %53,  %54,  %55,  "
-        " %56,  %57,  %58,  %59,  %60,  %61,  %62,  %63},"
-        " %64,"
-        " %65,"
-        " %66,    %67,  %68,  %69,  %70;\n"
-        "}\n"
-        : "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]),
-            "+f"(d[0][6]), "+f"(d[0][7]), "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]),
-            "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]), "+f"(d[2][0]), "+f"(d[2][1]),
-            "+f"(d[2][2]), "+f"(d[2][3]), "+f"(d[2][4]), "+f"(d[2][5]), "+f"(d[2][6]), "+f"(d[2][7]),
-            "+f"(d[3][0]), "+f"(d[3][1]), "+f"(d[3][2]), "+f"(d[3][3]), "+f"(d[3][4]), "+f"(d[3][5]),
-            "+f"(d[3][6]), "+f"(d[3][7]), "+f"(d[4][0]), "+f"(d[4][1]), "+f"(d[4][2]), "+f"(d[4][3]),
-            "+f"(d[4][4]), "+f"(d[4][5]), "+f"(d[4][6]), "+f"(d[4][7]), "+f"(d[5][0]), "+f"(d[5][1]),
-            "+f"(d[5][2]), "+f"(d[5][3]), "+f"(d[5][4]), "+f"(d[5][5]), "+f"(d[5][6]), "+f"(d[5][7]),
-            "+f"(d[6][0]), "+f"(d[6][1]), "+f"(d[6][2]), "+f"(d[6][3]), "+f"(d[6][4]), "+f"(d[6][5]),
-            "+f"(d[6][6]), "+f"(d[6][7]), "+f"(d[7][0]), "+f"(d[7][1]), "+f"(d[7][2]), "+f"(d[7][3]),
-            "+f"(d[7][4]), "+f"(d[7][5]), "+f"(d[7][6]), "+f"(d[7][7])
-        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
-            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
-}
-
 template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma(float d[WGMMA_N/16][8], __int128 desc128) {
     uint64_t desc_a = ((uint64_t*)&desc128)[0]; // N.B.: ULDC is up to 64-bit reads, so can't coalesce into 128-bit anyway
@@ -131,11 +99,8 @@ __device__ __forceinline__ void wgmma(float d[WGMMA_N/16][8], __int128 desc128) 
 
     // TODO: only using 256 right now, but 128 might be useful for the 1st & last iterations of each BM*BN tile
     // so we could parallelise some of the pre/post-processing with the matmuls of the other half of the tile
-    static_assert(WGMMA_N == 128 || WGMMA_N == 256);
-    if  constexpr (WGMMA_N == 256)
-        wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
-    if  constexpr (WGMMA_N == 128)
-        wgmma128<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
+    static_assert(WGMMA_N == 256);
+    wgmma256<ScaleD, ScaleA, ScaleB, TransA, TransB>(d, desc_a, desc_b);
 }
 
 template <uint32_t RegCount>
@@ -193,15 +158,6 @@ __device__ static __forceinline__ void wait_warpgroup_arrive(uint32_t mbar_ptr, 
     warpgroup_arrive();
 }
 
-__device__ static __forceinline__ void arrive(uint32_t mbar_ptr, uint32_t count=1) {
-    asm volatile (
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;\n"
-        :
-        : "r"(mbar_ptr), "r"(count)
-        : "memory"
-    );
-}
-
 __device__ static inline void load_async_multicast(uint32_t dst_ptr, void const* src_tma_map, uint32_t mbar_ptr, int global_col_idx, int global_row_idx, uint16_t cluster_mask) {
     uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
 
@@ -228,32 +184,6 @@ __device__ void arrive_cluster(uint32_t mbar_ptr, uint32_t cta_id, uint32_t coun
         "}"
         :
         : "r"(mbar_ptr), "r"(cta_id), "r"(count));
-}
-
-// not currently used as it wasn't any faster, but pretty cool
-template <int CLUSTERS=2>
-__device__ static __forceinline__ void smart_wait_arrive(int &arrived, uint32_t mbar_ptr_wait, int kPhaseBit_wait, uint32_t mbar_ptr_arrive, uint32_t cta_id, uint32_t count=1) {
-    asm volatile (
-        "{\n"
-        ".reg .pred P;\n"
-        ".reg .b32 remAddr32;\n\t"
-        "mbarrier.test_wait.parity.shared::cta.b64 P, [%1], %2;\n"
-        "selp.s32 %0, 0, 1, P;\n"
-        "@P bra.uni DONE;\n"
-        "\n"
-        "setp.lt.s32 P, %4, %6;"
-        "wgmma.wait_group.sync.aligned 0;\n"
-        "@!P bra.uni LAB_WAIT;\n"
-        "mapa.shared::cluster.u32  remAddr32, %3, %4;\n\t"
-        "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %5;\n\t"
-        "\n"
-        "LAB_WAIT:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 P, [%1], %2;\n"
-        "@!P                      bra.uni LAB_WAIT;\n"
-        "DONE:\n"
-        "}\n"
-        : "=r"(arrived) : "r"(mbar_ptr_wait), "r"(kPhaseBit_wait), "r"(mbar_ptr_arrive), "r"(cta_id), "r"(count), "r"(CLUSTERS) : "memory"
-    );
 }
 
 // to help the compiler not be silly... (threadIdx.x == constant should be enough, come on guys!)
@@ -497,8 +427,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                         data_bf16_col1[k] = ((bf16*)&data)[1];
                         idx_32b += 4 * 4;
                     }
-                    *block_C_thread_128b = *((int4*)data_bf16_col0);
-                    block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
+                    __stcs(block_C_thread_128b, *(int4*)data_bf16_col0);
+                    __stcs(&block_C_thread_128b[M/8], *(int4*)data_bf16_col1);
                     block_C_thread += 32*M;
                 }
 
@@ -568,8 +498,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                         data_bf16_col1[k] = ((bf16*)&data)[1];
                         idx_32b += 4 * 4;
                     }
-                    *block_C_thread_128b = *((int4*)data_bf16_col0);
-                    block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
+                    __stcs(block_C_thread_128b, *(int4*)data_bf16_col0);
+                    __stcs(&block_C_thread_128b[M/8], *(int4*)data_bf16_col1);
                     block_C_thread += 32*M;
                 }
             }
