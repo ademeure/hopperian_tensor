@@ -46,6 +46,9 @@ __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
 __device__ __forceinline__ void wgmma256(float d[16][8], uint64_t desc_a, uint64_t desc_b) {
+    // On H100, this takes 128 cycles: 256N * 64M * 16K * 2 flops = 512K
+    // 4096 BF16 flops per SM per clock ==> 512K / 4096 = 128 cycles
+    // So doing 4 of those with BK=64 takes 512 cycles
     asm volatile(
         "{\n"
         "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
@@ -363,9 +366,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
     uint32_t full_start = full_base + cluster_rank * 0x1000000;
     uint32_t empty_start = empty_base + cluster_rank * 0x1000000;
 
-    //if (threadIdx.x != 0 || blockIdx.x > 10) return;
-    //printf("blockIdx.x: %d, full_ptr(1): %u, cvt(&s.full[1]): %u, sa_ptr[0]: %u, cvt(&s.A[0]): %u, sb_ptr(1): %u, cvt(&s.B[1]): %u, full_start: %u, sB_start: %u\n", blockIdx.x, FULL_PTR(1), static_cast<uint32_t>(__cvta_generic_to_shared(&s.full[1])), SA_PTR(0), static_cast<uint32_t>(__cvta_generic_to_shared(&s.A[0])), SB_PTR(1), static_cast<uint32_t>(__cvta_generic_to_shared(&s.B[BK*BN])), full_start, sB_start);
-
     Schedule<1, NUM_SM/CLUSTERS, BM*CLUSTER_M, BN, 16/CLUSTER_M, 8, CLUSTER_M> schedule(M, N, cluster_rank, cluster_id);
 
     int num_block_m, num_block_n;
@@ -460,11 +460,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
         bool output_to_gmem = false;
 
         int num_blocks_k = K / BK;
-        //assert(num_blocks_k >= 9);
 
         while (schedule_next) {
             bf16* block_C_thread = &block_C[x + y_base*M];
-            // assumes num_blocks_k >= 8, i.e. K >= 512
             #pragma unroll
             for (int iter = 0; iter < 8; iter++) {
                 __int128 desc128 = descAB[desc_id];
@@ -574,32 +572,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                     block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
                     block_C_thread += 32*M;
                 }
-
-                /*
-                for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
-                    block_sC_128b[tid + n_tile * 128] = *(int4*)d_bf16[n_tile];
-                }
-                // synchronise per-warpgroup (don't need to read shared memory written by the other warpgroup)
-                asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
-
-                bf16* block_C_thread = &block_C[x + y_base*M];
-                #pragma unroll
-                for (int n = 0, y = y_base; n < 256; n += 32, y += 32, block_C_thread += 32*M) {
-                    int4* block_C_thread_128b = (int4*)block_C_thread;
-                    bf16 data_bf16_col0[8];
-                    bf16 data_bf16_col1[8];
-                    int idx_32b = idx_32b_base + (y / 16) * 4 * 128;
-
-                    for(int k = 0; k < 8; k++) {
-                        int data = block_sC_32b[idx_32b];
-                        data_bf16_col0[k] = ((bf16*)&data)[0];
-                        data_bf16_col1[k] = ((bf16*)&data)[1];
-                        idx_32b += 4 * 4;
-                    }
-                    *block_C_thread_128b = *((int4*)data_bf16_col0);
-                    block_C_thread_128b[M/8] = *((int4*)data_bf16_col1);
-                }
-                */
             }
         }
     }
@@ -614,16 +586,15 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     constexpr int CLUSTER_M = 2;
     constexpr int NUM_SM = 114; // H100 PCIe :(
     static_assert(NUM_SM % (CLUSTER_M) == 0);
+    static_assert(K >= 8 * BK, "K must be >= 8*BK (512 for BK=64)");
 
-    if (_prev_m != M) {
+    if (_prev_m != M || _prev_n != N || _prev_k != K) {
         d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
         d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
         d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
-        _prev_m = M;
-        _prev_n = N;
-        _prev_k = K;
+        _prev_m = M, _prev_n = N, _prev_k = K;
 
-        // TODO: less hacky (but only slightly so)
+        // TODO: make this slightly less hacky
         constexpr uint64_t desc_base = 0x4000004000010000;
         constexpr int K_iterations = BK/16;
         constexpr int uniqueA = K_iterations * QSIZE * CLUSTER_M;
@@ -635,8 +606,7 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
         constexpr int startB = startA + sizeA*QSIZE;
         constexpr int offsetK = 0x2;
 
-        uint64_t hostA[uniqueA];
-        uint64_t hostB[uniqueB];
+        uint64_t hostA[uniqueA], hostB[uniqueB];
         for (int i = 0; i < uniqueA; i++) {
             hostA[i] = (startA + (i % K_iterations) * offsetK + ((i / K_iterations) % QSIZE) * sizeA + ((i / K_iterations) / QSIZE) * sizeA_warpgroup_offset) | desc_base;
         }
@@ -655,10 +625,8 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
             next_desc_id_host[i] = ((K_iterations + i) % uniqueB) + (i >= uniqueB ? uniqueB : 0);
         }
         cudaMemcpyToSymbol(next_desc_id, next_desc_id_host, sizeof(next_desc_id_host));
-
     }
-    // Assert cached values are of same size
-    assert (M == _prev_m && N == _prev_n && K == _prev_k);
+
     auto* kernel = matmulKernel10<BM, BN, BK, NUM_THREADS, QSIZE, NUM_SM, CLUSTER_M>;
     constexpr size_t sMemSize = sizeof(SMem<BM, BN, BK, QSIZE>);
     static_assert(sMemSize < 256 * 1024);
