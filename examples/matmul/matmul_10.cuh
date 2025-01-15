@@ -239,7 +239,7 @@ template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
     alignas(128) bf16 A[BM*BK*QSIZE];
     alignas(128) bf16 B[BK*BN*QSIZE];
-    alignas(128) bf16 C[BN*BM/8];
+    alignas(128) bf16 C[BN*BM/4];
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
 };
 
@@ -248,7 +248,7 @@ struct SMem {
 #define SA_PTR(i) (sA_start + i*BK*BM*2)
 #define SB_PTR(i) (sB_start + i*BK*BN*2)
 
-template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTER_M, int DELAYED_WAIT=0>
+template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTER_M, int DELAYED_WAIT=0, bool RELU=false, bool SQUARED=false>
 __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 1) matmulKernel10(int M, int N, int K, bf16* C, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB) {
     constexpr int MINIMUM_ANY_DIMENSION = 256;
     constexpr int MINIMUM_K_ITERATIONS = MINIMUM_ANY_DIMENSION / BK;
@@ -369,13 +369,14 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
         float d[WGMMA_N/16][8];
         bf16 d_bf16[WGMMA_N/16][8];
 
-        bf16* block_sC = sC + wg_idx*B_WG_M*BN/8;
+        bf16* block_sC = sC + wg_idx*B_WG_M*BN/4;
         int4* block_sC_128b = (int4*)block_sC;
         int* block_sC_32b = (int*)block_sC;
         bf16 *block_C = C;
 
-        int4* out0 = &block_sC_128b[tid];
-        int4* out1 = &block_sC_128b[tid + 128];
+        int4* out0[2] = { &block_sC_128b[tid], &block_sC_128b[tid + B_WG_M*BN/(8*8)] };
+        int4* out1[2] = { &block_sC_128b[tid + 128], &block_sC_128b[tid + B_WG_M*BN/(8*8) + 128] };
+
         int desc_id = wg_idx * 64/WGMMA_K * QSIZE;
         constexpr __int128 desc_multiplier = ((__int128)0x2 << (__int128)64) | (__int128)0x2;
 
@@ -385,18 +386,30 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
         int idx_32b_x = ((x_wg % 16) / 8 + (x_wg / 16) * 32 * 4);
         int idx_32b_base = idx_32b_x + (y_base % 8) * 4 / 2 + ((y_base / 8) % 2) * 2;
 
-        int p = 0;
-        int qidx = 0, old_qidx = 0;
+        int p = 0, qidx = 0, old_qidx = 0;
         bool output_to_gmem = false;
 
         int num_blocks_k = K / BK;
 
         while (schedule_next) {
-            bf16* block_C_thread = &block_C[x + y_base*M];
+            float absmax = 0.0f;
+            int4* block_C_thread = (int4*)&block_C[x + y_base*M];
+
+            constexpr int post_process_iterations = 8;
+            constexpr int write_iterations = 4;
+            constexpr int unrolled_iterations = post_process_iterations + write_iterations;
+
             #pragma unroll
-            for (int iter = 0; iter < 8; iter++) {
+            for (int iter = 0; iter < unrolled_iterations; iter++) {
                 __int128 desc128 = descAB[desc_id];
                 desc_id = next_desc_id[desc_id];
+
+                // TODO: is the implicit sync from wait_warpgroup_arrive() + WGMMA enough?
+                // with double buffering, we only need to sync inside a warpgroup (not the full threadgroup)
+                if (iter < 8) {
+                    *out0[iter%2] = ((int4*)d_bf16)[iter*2];
+                    *out1[iter%2] = ((int4*)d_bf16)[iter*2+1];
+                }
 
                 if (iter > DELAYED_WAIT) {
                     warpgroup_wait<DELAYED_WAIT>();
@@ -411,25 +424,45 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                 warpgroup_commit_batch();
 
                 if (output_to_gmem) {
-                    int4* in0 = (int4*)d_bf16;
-                    *out0 = in0[iter*2];
-                    *out1 = in0[iter*2+1];
-                    // synchronise per-warpgroup (don't need to read shared memory written by the other warpgroup)
-                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                    if (iter < post_process_iterations) {
+                        bf16 data_bf16_col[2][8];
+                        int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
+                        if (iter % 2) idx_32b += B_WG_M*BN/(8*2);
 
-                    int4* block_C_thread_128b = (int4*)block_C_thread;
-                    bf16 data_bf16_col0[8], data_bf16_col1[8];
-                    int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
+                        for(int k = 0; k < 8; k++) {
+                            int data = block_sC_32b[idx_32b];
+                            idx_32b += 4 * 4;
 
-                    for(int k = 0; k < 8; k++) {
-                        int data = block_sC_32b[idx_32b];
-                        data_bf16_col0[k] = ((bf16*)&data)[0];
-                        data_bf16_col1[k] = ((bf16*)&data)[1];
-                        idx_32b += 4 * 4;
+                            if constexpr (SQUARED) {
+                                int zero = 0;
+                                asm volatile("fma.rn.bf16x2 %0, %1, %1, %2;" : "=r"(data) : "r"(data), "r"(zero));
+                            }
+                            d_bf16[iter*2+0][k] = ((bf16*)&data)[0];
+                            d_bf16[iter*2+1][k] = ((bf16*)&data)[1];
+
+                            /*int data0 = data << 16;
+                            int data1 = data & 0xFFFF0000;
+                            float d0 = *(float*)&data0;
+                            float d1 = *(float*)&data1;
+
+                            // TODO: Elementwise processing here, e.g. GELU
+                            // this will require an additional BF16 input in cases like GELU backwards
+                            // and smart prefetching from memory with limited available register/smem/l2 space...
+                            data_bf16_col[0][k] = (bf16)max(0.0f, d0);
+                            data_bf16_col[1][k] = (bf16)max(0.0f, d1);
+                            */
+                        }
+                    } else if (iter - post_process_iterations < write_iterations) {
+                        constexpr int writes_per_iteration = post_process_iterations / write_iterations;
+                        int i = (iter - post_process_iterations) * writes_per_iteration;
+
+                        for (int batch = 0; batch < writes_per_iteration; batch++, i++) {
+                            for (int col = 0; col < 2; col++) {
+                                __stcs(&block_C_thread[col*M/8], ((int4*)d_bf16)[i*2+col]);
+                            }
+                            block_C_thread += 4*M;
+                        }
                     }
-                    __stcs(block_C_thread_128b, *(int4*)data_bf16_col0);
-                    __stcs(&block_C_thread_128b[M/8], *(int4*)data_bf16_col1);
-                    block_C_thread += 32*M;
                 }
 
                 old_qidx = qidx - DELAYED_WAIT;
@@ -437,7 +470,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                 if (++qidx == QSIZE) {qidx = 0; p ^= 1; };
             }
 
-            for (int block_k_iter = 8; block_k_iter < num_blocks_k; block_k_iter++) {
+            for (int block_k_iter = unrolled_iterations; block_k_iter < num_blocks_k; block_k_iter++) {
                 __int128 desc128 = descAB[desc_id];
                 desc_id = next_desc_id[desc_id];
 
@@ -470,9 +503,15 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                 }
             }
 
-            for(int n_tile = 0, n = 0; n < 256; n += 16, n_tile++) {
-                for (int k = 0; k < 8; k++) {
-                    d_bf16[n_tile][k] = (bf16)d[n_tile][k];
+            for(int n_tile = 0; n_tile < 16; n_tile++) {
+                if constexpr (RELU) {
+                    for (int k = 0; k < 8; k += 2) {
+                        asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;" : "=r"(*(int*)(&d_bf16[n_tile][k])) : "f"(d[n_tile][k+1]), "f"(d[n_tile][k]));
+                    }
+                } else {
+                    for (int k = 0; k < 8; k++) {
+                        d_bf16[n_tile][k] = (bf16)d[n_tile][k];
+                    }
                 }
             }
 
@@ -481,25 +520,25 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                 bf16* block_C_thread = &block_C[x + y_base*M];
                 #pragma unroll
                 for (int iter = 0; iter < 8; iter++) {
-                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
-                    int4* in0 = (int4*)d_bf16;
-                    *out0 = in0[iter*2];
-                    *out1 = in0[iter*2+1];
+                    // double buffering means we don't need a barrier between the read and write, only write to read
+                    *out0[iter%2] = ((int4*)d_bf16)[iter*2];
+                    *out1[iter%2] = ((int4*)d_bf16)[iter*2+1];
                     // synchronise per-warpgroup (don't need to read shared memory written by the other warpgroup)
                     asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
 
-                    int4* block_C_thread_128b = (int4*)block_C_thread;
-                    bf16 data_bf16_col0[8], data_bf16_col1[8];
+                    bf16 data_bf16_col[2][8];
                     int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
+                    if (iter % 2) idx_32b += B_WG_M*BN/(8*2);
 
                     for(int k = 0; k < 8; k++) {
                         int data = block_sC_32b[idx_32b];
-                        data_bf16_col0[k] = ((bf16*)&data)[0];
-                        data_bf16_col1[k] = ((bf16*)&data)[1];
+                        data_bf16_col[0][k] = ((bf16*)&data)[0];
+                        data_bf16_col[1][k] = ((bf16*)&data)[1];
                         idx_32b += 4 * 4;
                     }
-                    __stcs(block_C_thread_128b, *(int4*)data_bf16_col0);
-                    __stcs(&block_C_thread_128b[M/8], *(int4*)data_bf16_col1);
+
+                    __stcs((int4*)&block_C_thread[0], *(int4*)data_bf16_col[0]);
+                    __stcs((int4*)&block_C_thread[M], *(int4*)data_bf16_col[1]);
                     block_C_thread += 32*M;
                 }
             }
