@@ -586,7 +586,7 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB) {
     constexpr int CLUSTER_M = 2;
     constexpr int NUM_SM = 114; // H100 PCIe :(
     static_assert(NUM_SM % (CLUSTER_M) == 0);
-    assert(K >= 8 * BK, "K must be >= 8*BK (512 for BK=64)");
+    assert(K >= 8 * BK);
 
     if (_prev_m != M || _prev_n != N || _prev_k != K) {
         d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
