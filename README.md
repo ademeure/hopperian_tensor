@@ -1,39 +1,5 @@
-# Fastest GPU kernels, written from scratch.
+# Insanely Fast H100 Matrix Multiplication & Hardened LLM Processing
 
-## Matrix Multiplication
+Goal: Persistent "hardened" kernel that handles everything that isn't attention in a GPT2/Llama2-like LLM for both forwards and backwards, with easy programmability for both "elementwise" and "row operations", including automatic FP8 with 256x256 scaling factors.
 
-Matrix multiplication of square bf16 matrices, accumulated in fp32.
-
-```
-N=4096
-Kernel: 763 TFLOPs
-cuBLAS: 716 TFLOPs
-
-N=8192
-Kernel: 808 TFLOPs
-cuBLAS: 795 TFLOPs
-```
-
-Explanation in https://cudaforfun.substack.com/p/outperforming-cublas-on-h100-a-worklog
-
-##### To run:
-```
-make matmul && out/matmul
-```
-Example kernels are in [`examples/matmul/`](https://github.com/pranjalssh/fast.cu/tree/main/examples/matmul) and orchestration is in [`matmul.cu`](https://github.com/pranjalssh/fast.cu/blob/main/matmul.cu)
-
-## Sum reduction
-
-We compute sum of 2^30 elements.
-
-##### To run:
-```
-make sum && out/sum
-```
-
-```
-Kernel: 3240.11 GB/s
-cub Library: 3193 GB/s
-```
-
-Example kernels are in [`sum.cu`](https://github.com/pranjalssh/fast.cu/tree/main/sum.cu)
+Originally forked from the H100 matrix multiplication code of https://github.com/pranjalssh/fast.cu/

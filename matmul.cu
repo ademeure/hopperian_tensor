@@ -42,19 +42,7 @@ void cudaCheck(cudaError_t error, const char *file, int line) {
 std::default_random_engine generator(69);
 #endif
 
-/*
-#include "examples/matmul/matmul_1.cuh"
-#include "examples/matmul/matmul_2.cuh"
-#include "examples/matmul/matmul_3.cuh"
-#include "examples/matmul/matmul_4.cuh"
-#include "examples/matmul/matmul_5.cuh"
-#include "examples/matmul/matmul_6.cuh"
-#include "examples/matmul/matmul_7.cuh"
-#include "examples/matmul/matmul_8.cuh"
-#include "examples/matmul/matmul_9.cuh"
-#include "examples/matmul/matmul_10.cuh"
-#include "examples/matmul/matmul_11.cuh"
-*/
+// ...
 #include "examples/matmul/matmul_10.cuh"
 
 #ifdef ENABLE_CUBLAS
