@@ -239,7 +239,7 @@ template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
     alignas(128) bf16 A[BM*BK*QSIZE];
     alignas(128) bf16 B[BK*BN*QSIZE];
-    alignas(128) bf16 C[BN*BM/4];
+    alignas(128) bf16 C[BN*BM/2];
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
 };
 
@@ -368,15 +368,15 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
 
         float d[WGMMA_N/16][8];
         bf16 d_bf16[WGMMA_N/16][8];
-        int4 input_elementwise[2][2];
+        int4 input_elementwise[4][2];
 
-        bf16* block_sC = sC + wg_idx*B_WG_M*BN/4;
+        bf16* block_sC = sC + wg_idx*B_WG_M*BN/2;
         int4* block_sC_128b = (int4*)block_sC;
         int* block_sC_32b = (int*)block_sC;
         int4 *block_C_thread;
 
-        int4* out0[2] = { &block_sC_128b[tid], &block_sC_128b[tid + B_WG_M*BN/(8*8)] };
-        int4* out1[2] = { &block_sC_128b[tid + 128], &block_sC_128b[tid + B_WG_M*BN/(8*8) + 128] };
+        int4* out0[4] = { &block_sC_128b[tid], &block_sC_128b[tid + B_WG_M*BN/(8*8)], &block_sC_128b[tid + B_WG_M*BN/(8*8)*2], &block_sC_128b[tid + B_WG_M*BN/(8*8)*3] };
+        int4* out1[4] = { &block_sC_128b[tid + 128], &block_sC_128b[tid + B_WG_M*BN/(8*8) + 128], &block_sC_128b[tid + B_WG_M*BN/(8*8)*2 + 128], &block_sC_128b[tid + B_WG_M*BN/(8*8)*3 + 128] };
 
         int desc_id = wg_idx * 64/WGMMA_K * QSIZE;
         constexpr __int128 desc_multiplier = ((__int128)0x2 << (__int128)64) | (__int128)0x2;
@@ -395,21 +395,24 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
         while (schedule_next) {
             float absmax = 0.0f;
 
+            constexpr int preprocess_iterations = 0;
             constexpr int post_process_iterations = 8;
-            constexpr int write_iterations = 4;
-            constexpr int unrolled_iterations = post_process_iterations + write_iterations;
+            constexpr int write_iterations = 0;
+            constexpr int unrolled_iterations = 12; //preprocess_iterations + post_process_iterations + write_iterations;
+
+            int compute_iter = 0;
+            int4* new_block_C_thread = (int4*)(C + num_block_n*BN*M + num_block_m*BM + x + y_base*M);
+
+            if (output_to_gmem) {
+                // todo: only do this here if we are reading an output-sized input value from gmem (e.g. GELU backwards)
+                *out0[1] = ((int4*)d_bf16)[2];
+                *out1[1] = ((int4*)d_bf16)[3];
+            }
 
             #pragma unroll
             for (int iter = 0; iter < unrolled_iterations; iter++) {
                 __int128 desc128 = descAB[desc_id];
                 desc_id = next_desc_id[desc_id];
-
-                // TODO: is the implicit sync from wait_warpgroup_arrive() + WGMMA enough?
-                // with double buffering, we only need to sync inside a warpgroup (not the full threadgroup)
-                if (iter < 8) {
-                    //*out0[iter%2] = ((int4*)d_bf16)[iter*2];
-                    //*out1[iter%2] = ((int4*)d_bf16)[iter*2+1];
-                }
 
                 if (iter > DELAYED_WAIT) {
                     warpgroup_wait<DELAYED_WAIT>();
@@ -425,27 +428,57 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                 warpgroup_commit_batch();
 
                 if (output_to_gmem) {
-                    if (iter < post_process_iterations) {
-                        // TODO: is the implicit sync from wait_warpgroup_arrive() + WGMMA enough?
-                        // we do a bar.sync after this, but not before, relying on WGMMA getting all warps synced "just enough"
-                        // not at all convinced this is safe without knowing all the nitty gritty details of the HW, but seems to work for now...
-                        *out0[0] = ((int4*)d_bf16)[iter*2];
-                        *out1[0] = ((int4*)d_bf16)[iter*2+1];
+                    if (iter == 0) {
+                        // todo: only do this here if we are reading an output-sized input value from gmem (e.g. GELU backwards)
+                        *out0[2] = ((int4*)d_bf16)[4];
+                        *out1[2] = ((int4*)d_bf16)[5];
+                        asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                        block_C_thread -= 4*M;
+                        input_elementwise[3][0] = __ldcs(block_C_thread);
+                        input_elementwise[3][1] = __ldcs(&block_C_thread[M/8]);
+                        block_C_thread += 4*M;
+                    } else if (iter == 2) {
+                        block_C_thread -= 5*4*M;
+                        __stcs(&block_C_thread[0], ((int4*)d_bf16)[6]);
+                        __stcs(&block_C_thread[M/8], ((int4*)d_bf16)[7]);
+                        block_C_thread += 5*4*M;
+                    } else if (iter == 6) {
+                        block_C_thread -= 7*4*M;
+                        for (int i = 1; i < 4; i++) {
+                            __stcs(&block_C_thread[0], ((int4*)d_bf16)[i*2 + 6]);
+                            __stcs(&block_C_thread[M/8], ((int4*)d_bf16)[i*2+1 + 6]);
+                            block_C_thread += 4*M;
+                        }
+                    } else if (iter == 11) {
+                        for (int i = 4; i < 8; i++) {
+                            __stcs(&block_C_thread[0], ((int4*)d_bf16)[(i*2)%8 + 6]);
+                            __stcs(&block_C_thread[M/8], ((int4*)d_bf16)[(i*2+1)%8 + 6]);
+                            block_C_thread += 4*M;
+                        }
+                    } else {
+                        int i = iter == 1 ? 0 : ((iter-2) / 5) * 4 + ((iter-2) % 5);
 
                         bf16 data_bf16_col[2][8];
                         int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
-                        //if (iter % 2) idx_32b += B_WG_M*BN/(8*2);
+                        idx_32b += (i%4)*B_WG_M*BN/(8*2);
+
+                        // TODO: is the implicit sync from wait_warpgroup_arrive() + WGMMA enough?
+                        // we do a bar.sync after this, but not before, relying on WGMMA getting all warps synced "just enough"
+                        // not at all convinced this is safe without knowing all the nitty gritty details of the HW, but seems to work for now...
+                        if (i < 5) {
+                            // todo: "just in time + barrier" instead of 3 steps ahead if we are not reading input_elementwise from gmem
+                            *out0[(i+3)%4] = ((int4*)d_bf16)[(i+3)*2];
+                            *out1[(i+3)%4] = ((int4*)d_bf16)[(i+3)*2+1];
+                        }
 
                         // WIP - hack to test performance reading an output-sized input value (e.g. accumulation, GELU backwards, etc.)
-                        //if (iter % 2 == 0 &&
-                        //   (input_elementwise[0][0].x + input_elementwise[0][0].y + input_elementwise[0][0].z + input_elementwise[0][0].w == 3454554 ||
-                        //    input_elementwise[0][1].x + input_elementwise[0][1].y + input_elementwise[0][1].z + input_elementwise[0][1].w == 3454154)) {
-                        //      idx_32b += 1;
-                        //}
-
-                        asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                        if ((input_elementwise[i%4][0].x + input_elementwise[i%4][0].y + input_elementwise[i%4][0].z + input_elementwise[i%4][0].w == 3454554 ||
+                             input_elementwise[i%4][1].x + input_elementwise[i%4][1].y + input_elementwise[i%4][1].z + input_elementwise[i%4][1].w == 3454154)) {
+                              idx_32b += 1;
+                        }
 
                         for(int k = 0; k < 8; k++) {
+                            // TODO: improve register bank conflicts by changing the "effective" thread idx for stores (and loads)
                             int data = block_sC_32b[idx_32b];
                             idx_32b += 4 * 4;
 
@@ -453,8 +486,11 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                                 int zero = 0;
                                 asm volatile("fma.rn.bf16x2 %0, %1, %1, %2;" : "=r"(data) : "r"(data), "r"(zero));
                             }
-                            d_bf16[iter*2+0][k] = ((bf16*)&data)[0];
-                            d_bf16[iter*2+1][k] = ((bf16*)&data)[1];
+                            d_bf16[(i*2+0)%8 + 6][k] = ((bf16*)&data)[0];
+                            d_bf16[(i*2+1)%8 + 6][k] = ((bf16*)&data)[1];
+
+                            // TODO: Allow splitting the loading from shared memory and (some of?) the processing into 2 steps
+                            // to give more time to do the processing
 
                             /*int data0 = data << 16;
                             int data1 = data & 0xFFFF0000;
@@ -469,30 +505,38 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                             */
                         }
 
+                        //__stcs(&block_C_thread[0], ((int4*)d_bf16)[i*2]);
+                        //__stcs(&block_C_thread[M/8], ((int4*)d_bf16)[i*2+1]);
+                        //block_C_thread += 4*M;
+
                         // WIP - hack to test performance reading an output-sized input value
-                        if (iter % 2 == 0 && iter < post_process_iterations - 1) {
-                            //input_elementwise[0][0] = __ldcs(&block_C_thread[(iter+1)*4*M]);
-                            //input_elementwise[0][1] = __ldcs(&block_C_thread[(iter+1)*4*M + M/8]);
+                        if (i >= 4) {
+                            if (i < 7) {
+                                input_elementwise[i%4][0] = __ldcs(new_block_C_thread);
+                                input_elementwise[i%4][1] = __ldcs(&new_block_C_thread[M/8]);
+                            }
+                            new_block_C_thread += 4*M;
+                        } else {
+                            input_elementwise[i%4][0] = __ldcs(block_C_thread);
+                            input_elementwise[i%4][1] = __ldcs(&block_C_thread[M/8]);
+                            block_C_thread += 4*M;
                         }
 
                         // WIP - hack to test performance reading an output-sized input value
                         // seems counter-productive :(
-                        /*if (iter < post_process_iterations - 2) {
-                            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(&block_C_thread[(iter+2)*4*M]));
-                            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(&block_C_thread[(iter+2)*4*M + M/8]));
+                        /*if (i < post_process_iterations - 2) {
+                            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(&block_C_thread[(i+2)*4*M]));
+                            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(&block_C_thread[(i+2)*4*M + M/8]));
                         }*/
 
-                    } else if (iter - post_process_iterations < write_iterations) {
-                        constexpr int writes_per_iteration = post_process_iterations / write_iterations;
-                        int i = (iter - post_process_iterations) * writes_per_iteration;
-
-                        for (int batch = 0; batch < writes_per_iteration; batch++, i++) {
-                            for (int col = 0; col < 2; col++) {
-                                __stcs(&block_C_thread[col*M/8], ((int4*)d_bf16)[i*2+col]);
-                            }
-                            block_C_thread += 4*M;
-                        }
                     }
+                } else if (iter % 2 && iter < 8) {
+                    int i = iter / 2;
+                    if (i < 3) {
+                        input_elementwise[i][0] = __ldcs(new_block_C_thread);
+                        input_elementwise[i][1] = __ldcs(&new_block_C_thread[M/8]);
+                    }
+                    new_block_C_thread += 4*M;
                 }
 
                 old_qidx = qidx - DELAYED_WAIT;
@@ -501,12 +545,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
             }
 
             output_to_gmem = true;
-            block_C_thread = (int4*)(C + num_block_n*BN*M + num_block_m*BM + x + y_base*M);
+            block_C_thread = new_block_C_thread;
             schedule_next = schedule.next(num_block_m, num_block_n);
-
-            // WIP - hack to test performance reading an output-sized input value
-            //input_elementwise[0][0] = __ldcs(&block_C_thread[0]);
-            //input_elementwise[0][1] = __ldcs(&block_C_thread[M/8]);
 
             for (int block_k_iter = unrolled_iterations; block_k_iter < num_blocks_k; block_k_iter++) {
                 __int128 desc128 = descAB[desc_id];
@@ -525,10 +565,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                 if (qidx < DELAYED_WAIT) old_qidx += QSIZE;
                 if (++qidx == QSIZE) {qidx = 0; p ^= 1; };
             }
-
-            // WIP - hack to test performance reading an output-sized input value
-            //input_elementwise[1][0] = __ldcs(&block_C_thread[4*M]);
-            //input_elementwise[1][1] = __ldcs(&block_C_thread[4*M + M/8]);
 
             warpgroup_wait<DELAYED_WAIT>();
             if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(old_qidx), tid);
@@ -551,21 +587,34 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTER_M, 1, 
                         d_bf16[n_tile][k] = (bf16)d[n_tile][k];
                     }
                 }
+                if (n_tile == 1) {
+                    // rely on dead code elimination & register allocator to free up these registers
+                    // i.e. at no point do we need more than bf16[14][8] for this, i.e. 56 registers
+                    // if we do more stores here to save registers, it has a small performance hit :(
+                    *out0[0] = ((int4*)d_bf16)[0];
+                    *out1[0] = ((int4*)d_bf16)[1];
+                }
+                if (n_tile == 3) {
+                    //*out0[1] = ((int4*)d_bf16)[2];
+                    //*out1[1] = ((int4*)d_bf16)[3];
+                }
             }
 
             // on the last iteration, we can't overlap the global memory writes with the matmuls, so do it immediately
             if (!schedule_next) {
+                block_C_thread -= 4*4*M;
                 #pragma unroll
                 for (int iter = 0; iter < 8; iter++) {
                     // double buffering means we don't need a barrier between the read and write, only write to read
-                    *out0[iter%2] = ((int4*)d_bf16)[iter*2];
-                    *out1[iter%2] = ((int4*)d_bf16)[iter*2+1];
-                    // synchronise per-warpgroup (don't need to read shared memory written by the other warpgroup)
+                    if (iter > 0) {
+                        *out0[iter%2] = ((int4*)d_bf16)[iter*2];
+                        *out1[iter%2] = ((int4*)d_bf16)[iter*2+1];
+                    }
                     asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
 
                     bf16 data_bf16_col[2][8];
                     int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
-                    if (iter % 2) idx_32b += B_WG_M*BN/(8*2);
+                    idx_32b += (iter%2)*B_WG_M*BN/(8*2);
 
                     for(int k = 0; k < 8; k++) {
                         int data = block_sC_32b[idx_32b];

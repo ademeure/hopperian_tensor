@@ -7,7 +7,7 @@
 #define ENABLE_CUBLAS
 #define ENABLE_RANDOM
 //#define ENABLE_TRUE_RANDOM
-#define SLEEP_BETWEEN_KERNELS_SEC 0 // optional rest to avoid thermal throttling between kernels
+#define SLEEP_BETWEEN_KERNELS_SEC 1 // optional rest to avoid thermal throttling between kernels
 #define REFERENCE_KERNEL 0
 constexpr bool RUN_VERIF = true;
 constexpr int max_size = 16384;
