@@ -60,7 +60,7 @@ void runCublasGemmBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 }
 #endif
 
-void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, bf16 *I) {
+void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, bf16 *I, unsigned int* scalar_gpu) {
   switch (kernel_num) {
     case 0:
 #ifdef ENABLE_CUBLAS
@@ -68,7 +68,7 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
 #endif
       break;
     case 10:
-      runKernel10(M, N, K, A, B, C, I);
+      runKernel10(M, N, K, A, B, C, I, scalar_gpu);
       break;
   }
 }
@@ -118,14 +118,14 @@ bool verify_matrix(bf16 *matRef, bf16 *matOut, int N) {
 }
 */
 
-__global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, int *result, size_t N) {
+__global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, unsigned int *error, size_t N) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < N) {
     float diff = fabs((float)matRef[i] - (float)matOut[i]);
     if (diff > 0.1) {
       // accept result if it looks like RELU
       if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f) {
-        *result = 0;
+        *error = 1;
       }
     }
   }
@@ -148,9 +148,9 @@ int main() {
   randomize_matrix(B, max_size * max_size);
   randomize_matrix(I, max_size * max_size);
 
-  int* result;
-  int result_host;
-  cudaMalloc((void**)&result, sizeof(int));
+  unsigned int* scalar_gpu;
+  unsigned int scalar_host;
+  cudaMalloc((void**)&scalar_gpu, sizeof(unsigned int));
   cudaCheck(cudaMalloc((void **)&dA, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dB, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dC, sizeof(bf16) * max_size * max_size));
@@ -189,14 +189,15 @@ int main() {
     if (run_verif) {
       cudaCheck(cudaMemset(dC, 0, sizeof(bf16) * max_size * max_size));
       cudaCheck(cudaMemset(dC_ref, 0, sizeof(bf16) * max_size * max_size));
-      cudaCheck(cudaMemset(result, 1, sizeof(int)));
+      cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
 
-      run_kernel(kernel_num, m, n, k, dA, dB, dC, dI);
-      run_kernel(REFERENCE_KERNEL, m, n, k, dA, dB, dC_ref, dI);
+      run_kernel(kernel_num, m, n, k, dA, dB, dC, dI, scalar_gpu);
+      run_kernel(REFERENCE_KERNEL, m, n, k, dA, dB, dC_ref, dI, scalar_gpu);
 
-      verify_matrix_kernel<<<CEIL_DIV(m * n, 1024), 1024>>>(dC_ref, dC, result, m * n);
-      cudaMemcpy(&result_host, result, sizeof(int), cudaMemcpyDeviceToHost); // can only be async because next memcpy isn't
-      printf("\n=======> Kernel %d -> VERIFICATION: %s\n\n", kernel_num, result_host ? "OK" : "!!!!! FAILED !!!!!");
+      //cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
+      verify_matrix_kernel<<<CEIL_DIV(m * n, 1024), 1024>>>(dC_ref, dC, scalar_gpu, m * n);
+      cudaMemcpy(&scalar_host, scalar_gpu, sizeof(unsigned int), cudaMemcpyDeviceToHost); // can only be async because next memcpy isn't
+      printf("\n=======> Kernel %d -> VERIFICATION: %s\n\n", kernel_num, scalar_host ? "!!!!! FAILED !!!!!" : "OK");
     }
 
     printf("Benchmarking kernel %d - time: %d\n", kernel_num, get_time());
@@ -204,7 +205,7 @@ int main() {
     // Benchmark
     cudaEventRecord(start);
     for (int j = 0; j < repeat_times; j++) {
-      run_kernel(kernel_num, m, n, k, dA, dB, dC, dI);
+      run_kernel(kernel_num, m, n, k, dA, dB, dC, dI, scalar_gpu);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(start);
@@ -221,11 +222,12 @@ int main() {
   free(A);
   free(B);
   free(C);
+  free(I);
   free(C_ref);
   cudaFree(dA);
   cudaFree(dB);
   cudaFree(dC);
   cudaFree(dC_ref);
-  cudaFree(result);
+  cudaFree(scalar_gpu);
   return 0;
 };

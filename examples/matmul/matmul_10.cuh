@@ -205,17 +205,28 @@ struct Schedule<1, NUM_SM, BM, BN, TM, TN, CLUSTER_M> {
     int it;
     int total_blocks_m, total_blocks_n;
     int rank_m;
+    unsigned int* counter;
 
-    __device__ __forceinline__ Schedule(int M, int N, int _rank_m, int _block) {
+    __device__ __forceinline__ Schedule(int M, int N, int _rank_m, int _block, unsigned int* _counter) {
         it = 0, block = _block, rank_m = _rank_m;
         total_blocks_m = CEIL_DIV(M, BM);
         total_blocks_n = CEIL_DIV(N, BN);
+        counter = _counter;
         //assert(CEIL_DIV(M, BM)%TM == 0 && total_blocks_n%TN == 0); // TODO: check on CPU
     }
 
     __device__ __forceinline__ bool next(int &block_m, int& block_n) {
-        int num = it*NUM_SM + block;
-        if (num >= total_blocks_m*total_blocks_n) return false;
+        //int num = it*NUM_SM + block;
+        //if (num >= total_blocks_m*total_blocks_n) return false;
+
+        int num = atomicInc(counter, 0xFFFFFFFF);
+        if (num >= total_blocks_m*total_blocks_n) {
+            int num_overflow = num - total_blocks_m*total_blocks_n;
+            if (num_overflow == NUM_SM - 1) {
+                atomicExch(counter, 0);
+            }
+            return false;
+        }
 
         int cur_tile = num / (TM*TN);
         int cur_tile_pos = num % (TM*TN);
@@ -246,7 +257,7 @@ struct SMem {
 #define SC_PTR(i) (sC_start + (i*BN*BM*2/4))
 
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTERS, int DELAYED_WAIT=0, bool RELU=false, bool SQUARED=false>
-__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, bf16* C, bf16* D, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapD, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, bf16* C, bf16* D, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapD, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counter) {
     constexpr int MINIMUM_ANY_DIMENSION = 256;
     constexpr int MINIMUM_K_ITERATIONS = MINIMUM_ANY_DIMENSION / BK;
 
@@ -267,8 +278,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     }
 
     // ------------------------------------------------------------------------------------------------
-    asm volatile("barrier.cluster.arrive;\n" : :);
-
     uint32_t cluster_id, cluster_rank;
     asm volatile("mov.u32 %0, %clusterid.x;\n" : "=r"(cluster_id) :);
     asm volatile("mov.u32 %0, %cluster_ctarank;\n" : "=r"(cluster_rank) :);
@@ -296,7 +305,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     int num_block_m, num_block_n;
     bool schedule_next;
     int p_schedule = 0;
-    asm volatile("barrier.cluster.wait;\n" : :);
     // ------------------------------------------------------------------------------------------------
 
     const int num_blocks_k = K / BK;
@@ -311,7 +319,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
         if (threadIdx.x == 0) {
             if (cluster_rank == 0) {
-                Schedule<1, NUM_SM/CLUSTERS, BM*CLUSTERS, BN, 16/CLUSTERS, 8, CLUSTERS> schedule(M, N, cluster_rank, cluster_id);
+                Schedule<1, NUM_SM/CLUSTERS, BM*CLUSTERS, BN, 16/CLUSTERS, 8, CLUSTERS> schedule(M, N, cluster_rank, cluster_id, counter);
                 schedule_next = schedule.next(num_block_m, num_block_n);
                 s.m_n_next_padding[0] = make_ushort4(num_block_m, num_block_n, schedule_next, 0);
                 for (int c = 1; c < CLUSTERS; c++) {
@@ -413,11 +421,11 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         }
     } else {
         asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
-        warpgroup_reg_alloc<240>();
-        wg_idx -= 1;
         for (int qidx = 0; qidx < QSIZE; qidx++) {
             if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(qidx), tid);
         }
+        warpgroup_reg_alloc<240>();
+        wg_idx -= 1;
 
         float d[WGMMA_N/16][8];
         bf16 d_bf16[WGMMA_N/16][8];
@@ -640,7 +648,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     }
 }
 
-void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, bf16 *I) {
+void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, bf16 *I, unsigned int* zeroed_scalar_gpu) {
     constexpr int BM = 128;
     constexpr int BN = 256;
     constexpr int BK = 64;
@@ -696,7 +704,7 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, bf16 *I) {
     static_assert(sMemSize < 256 * 1024);
     cudaCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
 
-    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, C, I, d_tma_map_C, d_tma_map_I, d_tma_map_A, d_tma_map_B);
+    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, C, I, d_tma_map_C, d_tma_map_I, d_tma_map_A, d_tma_map_B, zeroed_scalar_gpu);
 }
 
 } // namespace M10
