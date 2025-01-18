@@ -24,6 +24,73 @@ __device__ void warpgroup_wait() {
     asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
+
+/*
+        d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
+        d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
+        d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
+        d_tma_map_I = create_tensor_map2<BN/8, BM, false>(I, N, M);
+*/
+
+/*
+template <int BlockMajorSize=32, int BlockMinorSize=128, bool swizzle=true>
+__host__ static inline CUtensorMap create_tensor_map2(bf16* gmem_ptr, int global_height, int global_width) {
+    CUtensorMap tma_map;
+    void* gmem_address = (void*)gmem_ptr;
+    static_assert(BlockMinorSize >= 128);
+    assert(global_width % 128 == 0);
+    uint64_t gmem_prob_shape[5] = {128, (uint64_t)global_height, (uint64_t)global_width/128, 1, 1};
+    uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width, 128*sizeof(bf16), 0, 0, 0};
+    uint32_t smem_box_shape[5] = {128, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/128), 1, 1};
+    uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+
+    CUresult result = cuTensorMapEncodeTiled(
+        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address, gmem_prob_shape,
+        gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    assert(result == CUDA_SUCCESS);
+    return tma_map;
+}
+*/
+
+/*
+expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(bf16));
+load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, num_block_m*BM);
+load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM/2, previous_n*BN + block_k_iter*BN/8);
+
+__device__ static __forceinline__ void load_async(uint32_t dst_ptr, void const* src_tma_map, uint32_t mbar_ptr, int global_col_idx, int global_row_idx) {
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
+
+    asm volatile (
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4, %5}], [%2];\n"
+        :: "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx/64)
+        : "memory"
+    );
+}
+*/
+
+template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true>
+__host__ static inline CUtensorMap create_tensor_map2(bf16* gmem_ptr, int global_height, int global_width) {
+    CUtensorMap tma_map;
+    void* gmem_address = (void*)gmem_ptr;
+    static_assert(BlockMinorSize >= 128);
+    assert(global_width % 128 == 0);
+    uint64_t gmem_prob_shape[5] = {128, (uint64_t)global_height, (uint64_t)global_width/128, 1, 1};
+    uint64_t gmem_prob_stride[5] = {sizeof(bf16) * global_width, 128*sizeof(bf16), 0, 0, 0};
+    uint32_t smem_box_shape[5] = {128, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/128), 1, 1};
+    uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
+
+    CUresult result = cuTensorMapEncodeTiled(
+        &tma_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, gmem_address, gmem_prob_shape,
+        gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
+        swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+
+    assert(result == CUDA_SUCCESS);
+    return tma_map;
+}
+
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true>
 __host__ static inline CUtensorMap create_tensor_map(bf16* gmem_ptr, int global_height, int global_width) {
     CUtensorMap tma_map;
@@ -195,6 +262,50 @@ __device__ static __forceinline__ void elect_or_exit() {
 
 
 
+/*
+
+
+__device__ static inline void load_async(bf16 *dst, void const* src_tma_map, uint64_t* bar, int global_col_idx, int global_row_idx) {
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
+    uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    uint32_t dst_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+
+    // We use 3d tiling to load from GMEM to SMEM. 2d tiling only works for tiles <= 64 columns.
+    // For larger tiles, we need 3d tiling:
+    // First dimension: 64 (columns)
+    // Second dimension: Row
+    // Third dimension: Column / 64
+    // I spent a lot of time figuring this out. Hope this gets documented at some point.
+    asm volatile (
+        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%3, %4, %5}], [%2];"
+        :
+        : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr),
+        "n"(0), "r"(global_row_idx), "r"(global_col_idx/64)
+        : "memory"
+    );
+}
+
+store_async(&tensorMapC, (bf16*)&sC[0], num_block_m*BM, num_block_n*BN);
+__device__ static inline void store_async(void const* dst_tma_map, bf16 *src, int global_col_idx, int global_row_idx) {
+    uint64_t tma_ptr  = reinterpret_cast<uint64_t>(dst_tma_map);
+    uint32_t src_ptr  = static_cast<uint32_t>(__cvta_generic_to_shared(src));
+
+    asm volatile (
+        "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group"
+        " [%0, {%2, %3, %4}], [%1];"
+        :
+        : "l"(tma_ptr), "r"(src_ptr),
+        "n"(0), "r"(global_row_idx), "r"(global_col_idx / 64)
+        : "memory"
+    );
+}
+
+
+
+*/
+
+
 
 template<int VERSION, int NUM_SM, int BM, int BN, int TM, int TN, int CLUSTER_M>
 struct Schedule;
@@ -247,17 +358,17 @@ struct SMem {
     alignas(128) bf16 B[BK*BN*QSIZE];
     alignas(128) bf16 C[BN*BM/2];
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
-    alignas(8) ushort4 m_n_next_padding[2];
+    alignas(8) ushort4 m_n_next_padding[4];
 };
 
 #define FULL_PTR(i) (full_start + i*8)
 #define EMPTY_PTR(i) (empty_start + i*8)
 #define SA_PTR(i) (sA_start + i*BK*BM*2)
 #define SB_PTR(i) (sB_start + i*BK*BN*2)
-#define SC_PTR(i) (sC_start + (i*BN*BM*2/4))
+#define SC_PTR(i) (sC_start + (i*BM*BN*2)/8)
 
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTERS, int DELAYED_WAIT=0, bool RELU=false, bool SQUARED=false>
-__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, bf16* C, bf16* D, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapD, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counter) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, bf16* C, bf16* D, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapI, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counter) {
     constexpr int MINIMUM_ANY_DIMENSION = 256;
     constexpr int MINIMUM_K_ITERATIONS = MINIMUM_ANY_DIMENSION / BK;
 
@@ -317,60 +428,108 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         elect_or_exit();
         int p = 0, qidx = 0;
 
-        if (threadIdx.x == 0) {
+        if (threadIdx.x == 64) {
             if (cluster_rank == 0) {
                 Schedule<1, NUM_SM/CLUSTERS, BM*CLUSTERS, BN, 16/CLUSTERS, 8, CLUSTERS> schedule(M, N, cluster_rank, cluster_id, counter);
                 schedule_next = schedule.next(num_block_m, num_block_n);
-                s.m_n_next_padding[0] = make_ushort4(num_block_m, num_block_n, schedule_next, 0);
-                for (int c = 1; c < CLUSTERS; c++) {
-                    ushort4* ptr;
-                    asm volatile("mapa.shared::cluster.u64  %0, %1, %2;\n\t" : "=l"(ptr) : "l"(&s.m_n_next_padding[0]), "r"(c));
-                    *ptr = make_ushort4(num_block_m, num_block_n, schedule_next, 0);
+
+                ushort4* mn_shared_ptr[CLUSTERS];
+                for (int c = 0; c < CLUSTERS; c++) {
+                    asm volatile("mapa.shared::cluster.u64  %0, %1, %2;\n\t" : "=l"(mn_shared_ptr[c]) : "l"(s.m_n_next_padding), "r"(c));
+                    mn_shared_ptr[c][0] = make_ushort4(num_block_m, num_block_n, schedule_next, 0);
                 }
                 asm volatile("barrier.cluster.arrive;\n" : :);
 
+                while (schedule_next) {
+                    asm volatile("barrier.sync 8, 64;\n" ::);
+                    schedule_next = schedule.next(num_block_m, num_block_n);
+                    p_schedule = (p_schedule + 1) % 4;
+                    for (int c = 0; c < CLUSTERS; c++) {
+                        mn_shared_ptr[c][p_schedule] = make_ushort4(num_block_m, num_block_n, schedule_next, 0);
+                    }
+                }
+            } else {
+                asm volatile("barrier.cluster.arrive;\n" : :);
+            }
+        } else if (threadIdx.x == 0) {
+            asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
+            ushort4 m_n_padding = s.m_n_next_padding[0];
+            num_block_m = m_n_padding.x + cluster_rank;
+            num_block_n = m_n_padding.y;
+            schedule_next = m_n_padding.z;
+
+            bool first = true;
+            int previous_m = -1, previous_n = 0;
+
+            if (cluster_rank == 0) {
                 constexpr uint32_t multicast_mask = (1 << CLUSTERS) - 1;
                 while (schedule_next) {
-                    int current_m = num_block_m, current_n = num_block_n;
-                    schedule_next = schedule.next(num_block_m, num_block_n);
-                    p_schedule ^= 1;
-                    s.m_n_next_padding[p_schedule] = make_ushort4(num_block_m, num_block_n, schedule_next, 0);
-                    for (int c = 1; c < CLUSTERS; c++) {
-                        ushort4* ptr;
-                        asm volatile("mapa.shared::cluster.u64  %0, %1, %2;\n\t" : "=l"(ptr) : "l"(&s.m_n_next_padding[p_schedule]), "r"(c));
-                        *ptr = make_ushort4(num_block_m, num_block_n, schedule_next, 0);
+                    asm volatile("barrier.arrive 8, 64;\n" ::);
+
+                    int block_k_iter = 0;
+                    if (!first) {
+                        for (; block_k_iter < 8; block_k_iter++) {
+                            expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(bf16));
+                            //expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM)*sizeof(bf16));
+
+                            load_async_multicast(SB_PTR(qidx), &tensorMapB, FULL_PTR(qidx), block_k_iter*BK, num_block_n*BN, multicast_mask);
+                            load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, num_block_m*BM);
+                            load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
+
+                            if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
+                            __nanosleep(128); // TODO: check if nanosleep helps beyond noise (I think it does)
+                            wait(EMPTY_PTR(qidx), p);
+                        }
                     }
 
                     #pragma unroll 2
-                    for (int block_k_iter = 0; block_k_iter < num_blocks_k;) {
+                    for (; block_k_iter < num_blocks_k;) {
                         if constexpr (MINIMUM_K_ITERATIONS % QSIZE == 0) {
                             qidx = 0;
                         }
                         #pragma unroll MINIMUM_K_ITERATIONS
                         for (int j = 0; j < MINIMUM_K_ITERATIONS; j++, block_k_iter++) {
                             expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM)*sizeof(bf16));
-                            load_async_multicast(SB_PTR(qidx), &tensorMapB, FULL_PTR(qidx), block_k_iter*BK, current_n*BN, multicast_mask);
-                            load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, current_m*BM);
+                            load_async_multicast(SB_PTR(qidx), &tensorMapB, FULL_PTR(qidx), block_k_iter*BK, num_block_n*BN, multicast_mask);
+                            load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, num_block_m*BM);
 
                             if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
-                            // TODO: check if nanosleep helps beyond noise, but it really seems to (very very slightly)!
-                            // (syncs stuff at the beginning so qidx0 is fetched for everything before qidx1 for other threadblocks)
-                            // (+ reduces unnecessary looping / 'soft spinlocking' for the mbarrier wait?)
-                            __nanosleep(128);
+                            __nanosleep(128); // TODO: check if nanosleep helps beyond noise (I think it does)
                             wait(EMPTY_PTR(qidx), p);
                         }
                     }
+                    ushort4 m_n_padding = s.m_n_next_padding[++p_schedule & 3];
+                    first = false, previous_m = num_block_m, previous_n = num_block_n;
+                    num_block_m = m_n_padding.x + cluster_rank, num_block_n = m_n_padding.y, schedule_next = m_n_padding.z;
+
+                    /*if (!schedule_next) {
+                        for (int i = 0; i < 8; i++) {
+                            expect_bytes(FULL_PTR(qidx), (BM*BN/8)*sizeof(bf16));
+                            load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + i*BN/8);
+                            if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
+                            if (i < 7) wait(EMPTY_PTR(qidx), p);
+                        }
+                    }*/
                 }
             } else {
-                asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
-                ushort4 m_n_padding = s.m_n_next_padding[0];
-                num_block_m = m_n_padding.x + cluster_rank;
-                num_block_n = m_n_padding.y;
-                schedule_next = m_n_padding.z;
-
                 while (schedule_next) {
+                    int block_k_iter = 0;
+                    if (!first) {
+                        for (; block_k_iter < 8; block_k_iter++) {
+                            expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(bf16));
+                            //expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM)*sizeof(bf16));
+
+                            load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, num_block_m*BM);
+                            load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
+
+                            if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
+                            __nanosleep(128); // TODO: check if nanosleep helps beyond noise (I think it does)
+                            wait(EMPTY_PTR(qidx), p);
+                        }
+                    }
+
                     #pragma unroll 2
-                    for (int block_k_iter = 0; block_k_iter < num_blocks_k;) {
+                    for (; block_k_iter < num_blocks_k;) {
                         if constexpr (MINIMUM_K_ITERATIONS % QSIZE == 0) {
                             qidx = 0;
                         }
@@ -383,15 +542,22 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                             wait(EMPTY_PTR(qidx), p);
                         }
                     }
-                    p_schedule ^= 1;
-                    ushort4 m_n_padding = s.m_n_next_padding[p_schedule];
-                    num_block_m = m_n_padding.x + cluster_rank;
-                    num_block_n = m_n_padding.y;
-                    schedule_next = m_n_padding.z;
+                    ushort4 m_n_padding = s.m_n_next_padding[++p_schedule & 3];
+                    first = false, previous_m = num_block_m, previous_n = num_block_n;
+                    num_block_m = m_n_padding.x + cluster_rank, num_block_n = m_n_padding.y, schedule_next = m_n_padding.z;
+
+                    /*if (!schedule_next) {
+                        for (int i = 0; i < 8; i++) {
+                            expect_bytes(FULL_PTR(qidx), (BM*BN/8)*sizeof(bf16));
+                            load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + i*BN/8);
+                            if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
+                            if (i < 7) wait(EMPTY_PTR(qidx), p);
+                        }
+                    }*/
                 }
             }
         } else if (threadIdx.x == 32) {
-        asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
+            asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
             ushort4 m_n_padding = s.m_n_next_padding[0];
             num_block_m = m_n_padding.x + cluster_rank;
             num_block_n = m_n_padding.y;
@@ -412,11 +578,18 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                         if (++qidx == QSIZE) { qidx = 0; p ^= 1;}
                     }
                 }
-                p_schedule ^= 1;
-                ushort4 m_n_padding = s.m_n_next_padding[p_schedule];
-                num_block_m = m_n_padding.x + cluster_rank;
-                num_block_n = m_n_padding.y;
-                schedule_next = m_n_padding.z;
+                ushort4 m_n_padding = s.m_n_next_padding[++p_schedule & 3];
+                num_block_m = m_n_padding.x + cluster_rank, num_block_n = m_n_padding.y, schedule_next = m_n_padding.z;
+
+                /*if (!schedule_next) {
+                    for (int i = 0; i < 8; i++) {
+                        wait(FULL_PTR(qidx), p);
+                        asm volatile("barrier.arrive 5, 160;\n" ::);
+                        asm volatile("barrier.arrive 6, 160;\n" ::);
+                        asm volatile("barrier.sync 7, 288;\n" ::);
+                        if (++qidx == QSIZE) { qidx = 0; p ^= 1;}
+                    }
+                }*/
             }
         }
     } else {
@@ -430,13 +603,13 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         float d[WGMMA_N/16][8];
         bf16 d_bf16[WGMMA_N/16][8];
 
-        bf16* block_sC = sC + wg_idx*B_WG_M*BN/2;
+        bf16* block_sC = sC + wg_idx*64*32; //wg_idx*B_WG_M*BN/2;
         int4* block_sC_128b = (int4*)block_sC;
         int* block_sC_32b = (int*)block_sC;
         int4 *block_C_thread;
 
-        int4* out0[4] = { &block_sC_128b[tid], &block_sC_128b[tid + B_WG_M*BN/(8*8)], &block_sC_128b[tid + B_WG_M*BN/(8*8)*2], &block_sC_128b[tid + B_WG_M*BN/(8*8)*3] };
-        int4* out1[4] = { &block_sC_128b[tid + 128], &block_sC_128b[tid + B_WG_M*BN/(8*8) + 128], &block_sC_128b[tid + B_WG_M*BN/(8*8)*2 + 128], &block_sC_128b[tid + B_WG_M*BN/(8*8)*3 + 128] };
+        int4* out0[4] = { &block_sC_128b[tid], &block_sC_128b[tid + 512], &block_sC_128b[tid + 1024], &block_sC_128b[tid + 1536] };
+        int4* out1[4] = { &block_sC_128b[tid + 128], &block_sC_128b[tid + 640], &block_sC_128b[tid + 1152], &block_sC_128b[tid + 1664] };
 
         int desc_id = wg_idx * 64/WGMMA_K * QSIZE;
         constexpr __int128 desc_multiplier = ((__int128)0x2 << (__int128)64) | (__int128)0x2;
@@ -457,6 +630,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         num_block_n = m_n_padding.y;
         schedule_next = m_n_padding.z;
 
+        int previous_block_m = num_block_m, previous_block_n = num_block_n;
+
         while (schedule_next) {
             float absmax = 0.0f;
 
@@ -466,7 +641,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             constexpr int unrolled_iterations = 12; //preprocess_iterations + post_process_iterations + write_iterations;
 
             int compute_iter = 0;
-            int4* new_block_C_thread = (int4*)(C + num_block_n*BN*M + num_block_m*BM + x + y_base*M);
 
             #pragma unroll
             for (int iter = 0; iter < unrolled_iterations; iter++) {
@@ -494,7 +668,23 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
                         bf16 data_bf16_col[2][8];
                         int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
-                        idx_32b += (i%4)*B_WG_M*BN/(8*2);
+                        idx_32b += (i%4)*2*B_WG_M*BN/(8*2);
+
+                        int4 accum0, accum1;
+                        int4* current_input = (int4*)&sC[(i%4) * 512 * 8];
+                        int address = (x%64)/8 + y_base*(64/8) + (x/64)*(64*32/8);
+                        accum0 = current_input[address];
+                        accum1 = current_input[address + 64/8];
+
+                        asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+
+                        for(int k = 0; k < 8; k++) {
+                            //d_bf16[i*2+0][k] = (bf16)(/*(float)d_bf16[i*2+0][k] + */(float)((bf16*)&accum0)[k]);
+                            //d_bf16[i*2+1][k] = (bf16)(/*(float)d_bf16[i*2+1][k] + */(float)((bf16*)&accum1)[k]);
+
+                            //d_bf16[i*2+0][k] = (bf16)(x + k);
+                            //d_bf16[i*2+1][k] = (bf16)(x + k);
+                        }
 
                         // TODO: is the implicit sync from wait() + WGMMA enough?
                         // we do a bar.sync after this, but not before, relying on WGMMA getting all warps synced "just enough"
@@ -521,8 +711,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                                 int zero = 0;
                                 asm volatile("fma.rn.bf16x2 %0, %1, %1, %2;" : "=r"(data) : "r"(data), "r"(zero));
                             }
-                            d_bf16[i*2+0][k] = ((bf16*)&data)[0];
-                            d_bf16[i*2+1][k] = ((bf16*)&data)[1];
+                            d_bf16[i*2+0][k] = (bf16)((float)((bf16*)&data)[0] + (float)((bf16*)&accum0)[k]);
+                            d_bf16[i*2+1][k] = (bf16)((float)((bf16*)&data)[1] + (float)((bf16*)&accum1)[k]);
 
                             // TODO: Allow splitting the loading from shared memory and (some of?) the processing into 2 steps
                             // to give more time to do the processing
@@ -553,10 +743,15 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
                     } else {
                         int i = (iter - post_process_iterations) * (8 / write_iterations);
+
+                        if (i == 0 && previous_block_m == 0 && previous_block_n == 0) {
+                            //printf("(%d/%d): tid %d / wg_idx %d / cluster %d ===> %d (%d / %d)\n", previous_block_m, previous_block_n, tid, wg_idx, cluster_rank, (int)((intptr_t)block_C_thread - (intptr_t)C), (int)(((intptr_t)block_C_thread - (intptr_t)C) / 2) % 16384, (int)(((intptr_t)block_C_thread - (intptr_t)C) / 2) / 16384);
+                        }
+
                         for (int j = 0; j < 8 / write_iterations; i++, j++) {
                              __stcs(&block_C_thread[0], ((int4*)d_bf16)[i*2]);
                             __stcs(&block_C_thread[M/8], ((int4*)d_bf16)[i*2+1]);
-                            block_C_thread += 4*M;
+                            block_C_thread += (32*M)/8;
                         }
                     }
                 }
@@ -567,7 +762,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             }
 
             output_to_gmem = true;
-            block_C_thread = new_block_C_thread;
+            block_C_thread = (int4*)(C + num_block_n*BN*M + num_block_m*BM + x + y_base*M);
+            assert(num_block_m < M/BM && num_block_n < N/BN);
 
             for (int block_k_iter = unrolled_iterations; block_k_iter < num_blocks_k; block_k_iter++) {
                 __int128 desc128 = descAB[desc_id];
@@ -613,24 +809,29 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 }
             }
 
-            p_schedule ^= 1;
-            ushort4 m_n_padding = s.m_n_next_padding[p_schedule];
-            num_block_m = m_n_padding.x + cluster_rank;
-            num_block_n = m_n_padding.y;
-            schedule_next = m_n_padding.z;
+            previous_block_m = num_block_m;
+            previous_block_n = num_block_n;
+            ushort4 m_n_padding = s.m_n_next_padding[++p_schedule & 3];
+            num_block_m = m_n_padding.x + cluster_rank, num_block_n = m_n_padding.y, schedule_next = m_n_padding.z;
 
             // on the last iteration, we can't overlap the global memory writes with the matmuls, so do it immediately
             if (!schedule_next) {
-                #pragma unroll
-                for (int iter = 0; iter < 8; iter++) {
-                    // double buffering means we don't need a barrier between the read and write, only write to read
-                    *out0[iter%2] = ((int4*)d_bf16)[iter*2];
-                    *out1[iter%2] = ((int4*)d_bf16)[iter*2+1];
+
+                /*
+                for (int i = 0; i < 8; i++) {
+                    asm volatile("barrier.sync %0, 160;\n" :: "r"(wg_idx+5));
+                    asm volatile("barrier.arrive 7, 288;\n" ::);
+
+
+
+                    *out0[i%4] = ((int4*)d_bf16)[i*2];
+                    *out1[i%4] = ((int4*)d_bf16)[i*2+1];
                     asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+
 
                     bf16 data_bf16_col[2][8];
                     int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
-                    idx_32b += (iter%2)*B_WG_M*BN/(8*2);
+                    idx_32b += (i%4)*2*B_WG_M*BN/(8*2);
 
                     for(int k = 0; k < 8; k++) {
                         int data = block_sC_32b[idx_32b];
@@ -638,12 +839,70 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                         data_bf16_col[1][k] = ((bf16*)&data)[1];
                         idx_32b += 4 * 4;
                     }
+                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                    //__stcs((int4*)&C[0], *(int4*)data_bf16_col[0]);
+                    //__stcs(&block_C_thread[M/8], *(int4*)data_bf16_col[1]);
+                    block_C_thread += (32*M)/8;
+
+
+
+                    __stcs(&block_C_thread[0], make_int4(0, 0, 0, 0));
+                    //__stcs(&block_C_thread[M/8], make_int4(0, 0, 0, 0));
+                    block_C_thread += (32*M)/8;
+
+
+                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(qidx), tid);
+                    if (++qidx == QSIZE) {qidx = 0; p ^= 1; };
+                }
+                */
+
+
+                #pragma unroll 8
+                for (int iter = 0; iter < 8; iter++) {
+                    //asm volatile("barrier.sync %0, 160;\n" :: "r"(wg_idx+5));
+                    //asm volatile("barrier.arrive 7, 288;\n" ::);
+
+                    int4 accum0, accum1;
+                    int4* current_input = (int4*)&sC[(iter%4) * 512 * 8];
+                    int address = (x%64)/8 + y_base*(64/8) + (x/64)*(64*32/8);
+                    accum0 = current_input[address];
+                    accum1 = current_input[address + 64/8];
+
+                    // double buffering means we don't need a barrier between the read and write, only write to read
+                    *out0[iter%4] = ((int4*)d_bf16)[iter*2];
+                    *out1[iter%4] = ((int4*)d_bf16)[iter*2+1];
+                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+
+                    bf16 data_bf16_col[2][8];
+                    int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
+                    idx_32b += (iter%4)*2*B_WG_M*BN/(8*2);
+
+                    for(int k = 0; k < 8; k++) {
+                        int data = block_sC_32b[idx_32b];
+                        data_bf16_col[0][k] = (bf16)(((float)((bf16*)&data)[0]) + (float)((bf16*)&accum0)[k]);
+                        data_bf16_col[1][k] = (bf16)(((float)((bf16*)&data)[1]) + (float)((bf16*)&accum1)[k]);
+                        idx_32b += 4 * 4;
+                    }
+
+                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                    //__nanosleep(5000);
+                    //if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(qidx), tid);
+                    if (++qidx == QSIZE) {qidx = 0; p ^= 1; };
 
                     __stcs(&block_C_thread[0], *(int4*)data_bf16_col[0]);
                     __stcs(&block_C_thread[M/8], *(int4*)data_bf16_col[1]);
-                    block_C_thread += 4*M;
+                    block_C_thread += (32*M)/8;
                 }
             }
+
+/*
+            for (int i = 0; i < 4; i++) {
+                asm volatile("barrier.sync %0, 160;\n" :: "r"(wg_idx+5));
+                asm volatile("barrier.arrive 7, 288;\n" ::);
+                if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(qidx), tid);
+                if (++qidx == QSIZE) {qidx = 0; p ^= 1; };
+            }
+*/
         }
     }
 }
@@ -663,7 +922,7 @@ void runKernel10(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, bf16 *I, unsign
         d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
         d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
         d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
-        d_tma_map_I = create_tensor_map<BN, BM, true>(I, N, M);
+        d_tma_map_I = create_tensor_map<BN/8, BM, false>(I, N, M);
         _prev_m = M, _prev_n = N, _prev_k = K;
 
         // TODO: make this slightly less hacky

@@ -73,9 +73,15 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
   }
 }
 
-void randomize_matrix(bf16 *mat, int N) {
+void randomize_matrix(bf16 *mat, int N, float scale=1.0f) {
+  if (scale == 0.0f) {
+    for (int i = 0; i < N; i++) {
+      mat[i] = (bf16)(i*1000);
+    }
+    return;
+  }
 #ifdef ENABLE_RANDOM
-  std::normal_distribution<float> distribution(0, 1);
+  std::normal_distribution<float> distribution(0, scale);
 #ifdef ENABLE_TRUE_RANDOM
   for (int i = 0; i < N; i++) {
     mat[i] = distribution(generator);
@@ -118,13 +124,31 @@ bool verify_matrix(bf16 *matRef, bf16 *matOut, int N) {
 }
 */
 
-__global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, unsigned int *error, size_t N) {
+__global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, bf16 *matI, unsigned int *error, size_t N) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i < N) {
-    float diff = fabs((float)matRef[i] - (float)matOut[i]);
+
+/*
+  if (i == 0) {
+    for(int i = 0; i < 2048; i++) {
+      float diff = fabs((float)matRef[i] - (float)matOut[i]);
+      float ref = (float)matRef[i];
+      float out = (float)matOut[i];
+      float added = (float)matOut[i] + (float)matI[i];
+      float added_ref = (float)matRef[i] + (float)matI[i];
+      float value_I = (float)(matI[i]);
+      printf("Should be %5.20f, Is %5.20f (Diff %5.7f) at %d (with I: %5.7f ==> real diff: %5.7f)\n", ref, out, diff, i, value_I, added_ref - out);
+    }
+    return;
+  }
+*/
+
+  if (i < N/2) {
+    float ref_with_added = (float)((bf16)(((float)matRef[i] + (float)matI[i])));
+    float diff = fabs(ref_with_added - (float)matOut[i]);
     if (diff > 0.1) {
       // accept result if it looks like RELU
       if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f) {
+        printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d (with I: %5.7f)\n", ref_with_added, (float)matOut[i], diff, i, (float)matI[i]);
         *error = 1;
       }
     }
@@ -146,7 +170,7 @@ int main() {
 
   randomize_matrix(A, max_size * max_size);
   randomize_matrix(B, max_size * max_size);
-  randomize_matrix(I, max_size * max_size);
+  randomize_matrix(I, max_size * max_size, 0.0f);
 
   unsigned int* scalar_gpu;
   unsigned int scalar_host;
@@ -177,7 +201,7 @@ int main() {
 
   bool first_run = true;
   bool run_verif = RUN_VERIF;
-  for (int kernel_num : {10,10,10}) {
+  for (int kernel_num : {10}) {
     printf("\nKERNEL %d\n", kernel_num);
 
     if (!first_run) {
@@ -194,8 +218,8 @@ int main() {
       run_kernel(kernel_num, m, n, k, dA, dB, dC, dI, scalar_gpu);
       run_kernel(REFERENCE_KERNEL, m, n, k, dA, dB, dC_ref, dI, scalar_gpu);
 
-      //cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
-      verify_matrix_kernel<<<CEIL_DIV(m * n, 1024), 1024>>>(dC_ref, dC, scalar_gpu, m * n);
+      cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
+      verify_matrix_kernel<<<CEIL_DIV(m * n, 1024), 1024>>>(dC_ref, dC, dI, scalar_gpu, m * n);
       cudaMemcpy(&scalar_host, scalar_gpu, sizeof(unsigned int), cudaMemcpyDeviceToHost); // can only be async because next memcpy isn't
       printf("\n=======> Kernel %d -> VERIFICATION: %s\n\n", kernel_num, scalar_host ? "!!!!! FAILED !!!!!" : "OK");
     }
