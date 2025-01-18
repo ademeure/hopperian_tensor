@@ -60,7 +60,7 @@ void runCublasGemmBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 }
 #endif
 
-void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, int *DB = nullptr) {
+void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, bf16 *I) {
   switch (kernel_num) {
     case 0:
 #ifdef ENABLE_CUBLAS
@@ -68,7 +68,7 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
 #endif
       break;
     case 10:
-      runKernel10(M, N, K, A, B, C, DB);
+      runKernel10(M, N, K, A, B, C, I);
       break;
   }
 }
@@ -135,32 +135,32 @@ int main() {
   get_time();
   long m = max_size, n = max_size, k = max_size;
 
-  bf16 *A = nullptr, *B = nullptr, *C = nullptr, *C_ref = nullptr;  // host matrices
-  bf16 *dA = nullptr, *dB = nullptr, *dC = nullptr, *dC_ref = nullptr; // device matrices
-
-  int *DB = nullptr; int *dDB = nullptr;
+  bf16 *A = nullptr, *B = nullptr, *C = nullptr, *I = nullptr, *C_ref = nullptr;  // host matrices
+  bf16 *dA = nullptr, *dB = nullptr, *dC = nullptr, *dI = nullptr, *dC_ref = nullptr; // device matrices
 
   A = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
   B = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
   C = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
+  I = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
   C_ref = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
-  DB = (int *)malloc(sizeof(int) * max_size * 128);
 
   randomize_matrix(A, max_size * max_size);
   randomize_matrix(B, max_size * max_size);
-  randomize_matrix(C, max_size * max_size);
+  randomize_matrix(I, max_size * max_size);
 
   int* result;
   int result_host;
   cudaMalloc((void**)&result, sizeof(int));
-  cudaCheck(cudaMalloc((void **)&dDB, sizeof(int) * max_size * 128));
   cudaCheck(cudaMalloc((void **)&dA, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dB, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dC, sizeof(bf16) * max_size * max_size));
+  cudaCheck(cudaMalloc((void **)&dI, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(bf16) * max_size * max_size));
 
   cudaCheck(cudaMemcpyAsync(dA, A, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
   cudaCheck(cudaMemcpyAsync(dB, B, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dC, I, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dI, I, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
 
 #ifdef ENABLE_CUBLAS
   cublasCreate(&cublas_handle);
@@ -189,15 +189,13 @@ int main() {
     if (run_verif) {
       cudaCheck(cudaMemset(dC, 0, sizeof(bf16) * max_size * max_size));
       cudaCheck(cudaMemset(dC_ref, 0, sizeof(bf16) * max_size * max_size));
-      cudaCheck(cudaMemset(dDB, ~0, sizeof(int) * max_size * 128));
       cudaCheck(cudaMemset(result, 1, sizeof(int)));
 
-      run_kernel(kernel_num, m, n, k, dA, dB, dC);
-      run_kernel(REFERENCE_KERNEL, m, n, k, dA, dB, dC_ref);
+      run_kernel(kernel_num, m, n, k, dA, dB, dC, dI);
+      run_kernel(REFERENCE_KERNEL, m, n, k, dA, dB, dC_ref, dI);
 
       verify_matrix_kernel<<<CEIL_DIV(m * n, 1024), 1024>>>(dC_ref, dC, result, m * n);
       cudaMemcpy(&result_host, result, sizeof(int), cudaMemcpyDeviceToHost); // can only be async because next memcpy isn't
-      cudaMemcpy(DB, dDB, sizeof(int) * max_size * 8, cudaMemcpyDeviceToHost);
       printf("\n=======> Kernel %d -> VERIFICATION: %s\n\n", kernel_num, result_host ? "OK" : "!!!!! FAILED !!!!!");
     }
 
@@ -206,7 +204,7 @@ int main() {
     // Benchmark
     cudaEventRecord(start);
     for (int j = 0; j < repeat_times; j++) {
-      run_kernel(kernel_num, m, n, k, dA, dB, dC);
+      run_kernel(kernel_num, m, n, k, dA, dB, dC, dI);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(start);
