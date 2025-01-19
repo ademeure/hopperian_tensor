@@ -1,7 +1,4 @@
-// pointless overkill for producer before changing approach completely
-
-// Deadlocks…
-
+constexpr bool ENABLE_C_INPUT = true;
 
 namespace M10 {
 
@@ -321,7 +318,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
 
             bool first = true;
-            int previous_m = -1, previous_n = 0;
+            int previous_m = -1, previous_n = -1;
 
             if (cluster_rank == 0) {
                 constexpr uint32_t multicast_mask = (1 << CLUSTERS) - 1;
@@ -329,16 +326,18 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     asm volatile("barrier.arrive 8, 64;\n" ::);
 
                     int block_k_iter = 0;
-                    if (!first) {
-                        for (; block_k_iter < 8; block_k_iter++) {
-                            expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(bf16));
-                            load_async_multicast(SB_PTR(qidx), &tensorMapB, FULL_PTR(qidx), block_k_iter*BK, block_n*BN, multicast_mask);
-                            load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
-                            load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
+                    if constexpr (ENABLE_C_INPUT) {
+                        if (!first) {
+                            for (; block_k_iter < 8; block_k_iter++) {
+                                expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(bf16));
+                                load_async_multicast(SB_PTR(qidx), &tensorMapB, FULL_PTR(qidx), block_k_iter*BK, block_n*BN, multicast_mask);
+                                load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
+                                load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
 
-                            if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
-                            //__nanosleep(128);
-                            wait(EMPTY_PTR(qidx), p);
+                                if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
+                                //__nanosleep(128);
+                                wait(EMPTY_PTR(qidx), p);
+                            }
                         }
                     }
 
@@ -365,15 +364,17 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             } else {
                 while (schedule_next) {
                     int block_k_iter = 0;
-                    if (!first) {
-                        for (; block_k_iter < 8; block_k_iter++) {
-                            expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(bf16));
-                            load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
-                            load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
+                    if constexpr (ENABLE_C_INPUT) {
+                        if (!first) {
+                            for (; block_k_iter < 8; block_k_iter++) {
+                                expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(bf16));
+                                load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
+                                load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
 
-                            if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
-                            //__nanosleep(128);
-                            wait(EMPTY_PTR(qidx), p);
+                                if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
+                                //__nanosleep(128);
+                                wait(EMPTY_PTR(qidx), p);
+                            }
                         }
                     }
 
@@ -397,13 +398,15 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 }
             }
 
-            if (!schedule_next) {
-                // TODO: all of A/B for that qidx is free by that point; we should be able to do this in a single step
-                for (int i = 0; i < 8; i++) {
-                    expect_bytes(FULL_PTR(qidx), (BM*BN/8)*sizeof(bf16));
-                    load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + i*BN/8);
-                    if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
-                    wait(EMPTY_PTR(qidx), p);
+            if constexpr (ENABLE_C_INPUT) {
+                if (!first) {
+                    // TODO: all of A/B for that qidx is free by this point; so we could theoretically do it in a single step
+                    for (int i = 0; i < 8; i++) {
+                        expect_bytes(FULL_PTR(qidx), (BM*BN/8)*sizeof(bf16));
+                        load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + i*BN/8);
+                        if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
+                        wait(EMPTY_PTR(qidx), p);
+                    }
                 }
             }
         } else if (threadIdx.x == 32) {
@@ -446,8 +449,16 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         int* block_sC_32b = (int*)block_sC;
         int4 *block_C_thread;
 
-        int4* out0[4] = { &block_sC_128b[tid], &block_sC_128b[tid + 512], &block_sC_128b[tid + 1024], &block_sC_128b[tid + 1536] };
-        int4* out1[4] = { &block_sC_128b[tid + 128], &block_sC_128b[tid + 640], &block_sC_128b[tid + 1152], &block_sC_128b[tid + 1664] };
+        int idx = tid;
+        //idx ^= (idx & 48) ? 4 : 0;
+
+        int set_4 = idx & 4;
+        int set_32 = idx & 32;
+        //idx &= (~4) & (~32);
+        //idx |= (set_4 ? 32 : 0) | (set_32 ? 4 : 0);
+
+        int4* out0[4] = { &block_sC_128b[idx], &block_sC_128b[idx + 512], &block_sC_128b[idx + 1024], &block_sC_128b[idx + 1536] };
+        int4* out1[4] = { &block_sC_128b[idx + 128], &block_sC_128b[idx + 640], &block_sC_128b[idx + 1152], &block_sC_128b[idx + 1664] };
 
         int desc_id = wg_idx * 64/WGMMA_K * QSIZE;
         constexpr __int128 desc_multiplier = ((__int128)0x2 << (__int128)64) | (__int128)0x2;
@@ -493,41 +504,47 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 if (output_to_gmem) {
                     if (iter < post_process_iterations) {
                         int i = iter;
+
+                        int4 input0, input1;
+                        if constexpr (ENABLE_C_INPUT) {
+                            int address = (x%64)/8 + y_base*(64/8) + (x/64)*(64*32/8);
+                            int4 *input_base = (int4*)&sC[(i%4) * 512 * 8];
+                            input0 = input_base[address];
+                            input1 = input_base[address + 64/8];
+                            asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                        }
+
+                        int4 out0_data = ((int4*)d_bf16)[i*2], out1_data = ((int4*)d_bf16)[i*2+1];
+                        if (tid & 32) {
+                            out0_data = make_int4(out0_data.z, out0_data.w, out0_data.x, out0_data.y);
+                            out1_data = make_int4(out1_data.z, out1_data.w, out1_data.x, out1_data.y);
+                        }
+
                         int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
                         idx_32b += (i%4) * 2*WGMMA_M*BN / (8*2);
+                        idx_32b ^= (idx_32b & 128) ? 2 : 0;
 
-                        int address = (x%64)/8 + y_base*(64/8) + (x/64)*(64*32/8);
-                        int4 *input_base = (int4*)&sC[(i%4) * 512 * 8];
-                        int4 input0 = input_base[address];
-                        int4 input1 = input_base[address + 64/8];
+                        *out0[i%4] = out0_data, *out1[i%4] = out1_data;
                         asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
 
-                        // TODO: is the implicit sync from wait() + WGMMA enough?
-                        // we do a bar.sync after this, but not before, relying on WGMMA getting all warps synced "just enough"
-                        // not at all convinced this is safe without knowing all the nitty gritty details of the HW, but seems to work for now...
-                        if (i < 8) {
-                            // todo: "just in time + barrier" instead of 3 steps ahead if we are not reading input_elementwise from gmem
-                            *out0[(i+0)%4] = ((int4*)d_bf16)[(i+0)*2];
-                            *out1[(i+0)%4] = ((int4*)d_bf16)[(i+0)*2+1];
-                        }
-                        asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
-
+                        #pragma unroll 8
                         for(int k = 0; k < 8; k++) {
-                            // TODO: improve register bank conflicts by changing the "effective" thread idx for stores (and loads)
-                            int data = block_sC_32b[idx_32b];
-                            idx_32b += 4 * 4;
+                            int data = block_sC_32b[idx_32b + k*16];
 
                             if constexpr (SQUARED) {
-                                int zero = 0;
-                                asm volatile("fma.rn.bf16x2 %0, %1, %1, %2;" : "=r"(data) : "r"(data), "r"(zero));
+                                asm volatile("fma.rn.bf16x2 %0, %1, %1, %2;" : "=r"(data) : "r"(data), "r"(0));
                             }
-                            d_bf16[i*2+0][k] = (bf16)((float)((bf16*)&data)[0] + (float)((bf16*)&input0)[k]);
-                            d_bf16[i*2+1][k] = (bf16)((float)((bf16*)&data)[1] + (float)((bf16*)&input1)[k]);
 
-                            // TODO: Allow splitting the loading from shared memory and (some of?) the processing into 2 steps
-                            // to give more time to do the processing
+                            d_bf16[i*2+0][k] = ((bf16*)&data)[0];
+                            d_bf16[i*2+1][k] = ((bf16*)&data)[1];
 
-                            /*int data0 = data << 16;
+                            if constexpr (ENABLE_C_INPUT) {
+                                d_bf16[i*2+0][k] = (bf16)((float)d_bf16[i*2+0][k] + (float)((bf16*)&input0)[k]);
+                                d_bf16[i*2+1][k] = (bf16)((float)d_bf16[i*2+1][k] + (float)((bf16*)&input1)[k]);
+                            }
+
+                            /*
+                            int data0 = data << 16;
                             int data1 = data & 0xFFFF0000;
                             float d0 = *(float*)&data0;
                             float d1 = *(float*)&data1;
@@ -540,19 +557,15 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                             */
                         }
 
-                        if (DELAYED_WAIT > 0) {
+                        if constexpr (ENABLE_C_INPUT && DELAYED_WAIT > 0) {
                             asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx)); // TODO: when is this really required?
                         }
 
                     } else if (iter < post_process_iterations + write_iterations) {
                         int i = (iter - post_process_iterations) * (8 / write_iterations);
 
-                        if (i == 0 && previous_block_m == 0 && previous_block_n == 0) {
-                            //printf("(%d/%d): tid %d / wg_idx %d / cluster %d ===> %d (%d / %d)\n", previous_block_m, previous_block_n, tid, wg_idx, cluster_rank, (int)((intptr_t)block_C_thread - (intptr_t)C), (int)(((intptr_t)block_C_thread - (intptr_t)C) / 2) % 16384, (int)(((intptr_t)block_C_thread - (intptr_t)C) / 2) / 16384);
-                        }
-
                         for (int j = 0; j < 8 / write_iterations; i++, j++) {
-                             __stcs(&block_C_thread[0], ((int4*)d_bf16)[i*2]);
+                             __stcs(&block_C_thread[0],  ((int4*)d_bf16)[i*2]);
                             __stcs(&block_C_thread[M/8], ((int4*)d_bf16)[i*2+1]);
                             block_C_thread += (32*M)/8;
                         }
@@ -619,41 +632,73 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             // on the last iteration, we can't overlap the global memory writes with the matmuls, so do it immediately
             if (!schedule_next) {
                 #pragma unroll 8
-                for (int iter = 0; iter < 8; iter++) {
-                    wait(FULL_PTR(qidx), p);
-                    int address = (x%64)/8 + y_base*(64/8) + (x/64)*(64*32/8);
-                    int4 *input_base = (int4*)&sC[(iter%4) * 512 * 8];
-                    int4 input0 = input_base[address];
-                    int4 input1 = input_base[address + 64/8];
-                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                for (int i = 0; i < 8; i++) {
+                    int4 input0, input1;
+                    if constexpr (ENABLE_C_INPUT) {
+                        wait(FULL_PTR(qidx), p);
+                        int address = (x%64)/8 + y_base*(64/8) + (x/64)*(64*32/8);
+                        int4 *input_base = (int4*)&sC[(i%4) * 512 * 8];
+                        input0 = input_base[address];
+                        input1 = input_base[address + 64/8];
+                        asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                    }
 
-                    // double buffering means we don't need a barrier between the read and write, only write to read
-                    *out0[iter%4] = ((int4*)d_bf16)[iter*2];
-                    *out1[iter%4] = ((int4*)d_bf16)[iter*2+1];
-                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                    int4 out0_data = ((int4*)d_bf16)[i*2], out1_data = ((int4*)d_bf16)[i*2+1];
+                    if (tid & 32) {
+                        out0_data = make_int4(out0_data.z, out0_data.w, out0_data.x, out0_data.y);
+                        out1_data = make_int4(out1_data.z, out1_data.w, out1_data.x, out1_data.y);
+                    }
 
-                    bf16 data_bf16_col[2][8];
                     int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
-                    idx_32b += (iter%4) * 2*WGMMA_M*BN / (8*2);
+                    idx_32b += (i%4) * 2*WGMMA_M*BN / (8*2);
+                    idx_32b ^= (idx_32b & 128) ? 2 : 0;
 
+                    *out0[i%4] = out0_data, *out1[i%4] = out1_data;
+                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+
+                    #pragma unroll 8
                     for(int k = 0; k < 8; k++) {
-                        int data = block_sC_32b[idx_32b];
-                        data_bf16_col[0][k] = (bf16)(((float)((bf16*)&data)[0]) + (float)((bf16*)&input0)[k]);
-                        data_bf16_col[1][k] = (bf16)(((float)((bf16*)&data)[1]) + (float)((bf16*)&input1)[k]);
-                        idx_32b += 4 * 4;
+                        int data = block_sC_32b[idx_32b + k*16];
+
+                        if constexpr (SQUARED) {
+                            asm volatile("fma.rn.bf16x2 %0, %1, %1, %2;" : "=r"(data) : "r"(data), "r"(0));
+                        }
+
+                        d_bf16[i*2+0][k] = ((bf16*)&data)[0];
+                        d_bf16[i*2+1][k] = ((bf16*)&data)[1];
+
+                        if constexpr (ENABLE_C_INPUT) {
+                            d_bf16[i*2+0][k] = (bf16)((float)d_bf16[i*2+0][k] + (float)((bf16*)&input0)[k]);
+                            d_bf16[i*2+1][k] = (bf16)((float)d_bf16[i*2+1][k] + (float)((bf16*)&input1)[k]);
+                        }
+
+                        /*
+                        int data0 = data << 16;
+                        int data1 = data & 0xFFFF0000;
+                        float d0 = *(float*)&data0;
+                        float d1 = *(float*)&data1;
+
+                        // TODO: Elementwise processing here, e.g. GELU
+                        // this will require an additional BF16 input in cases like GELU backwards
+                        // and smart prefetching from memory with limited available register/smem/l2 space...
+                        d_bf16[i*2+0][k] = (bf16)max(0.0f, d0);
+                        d_bf16[i*2+1][k] = (bf16)max(0.0f, d1);
+                        */
                     }
 
                     asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
                     if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(qidx), tid);
                     if (++qidx == QSIZE) {qidx = 0; p ^= 1; };
 
-                    __stcs(&block_C_thread[0], *(int4*)data_bf16_col[0]);
-                    __stcs(&block_C_thread[M/8], *(int4*)data_bf16_col[1]);
+                    __stcs(&block_C_thread[0],   ((int4*)d_bf16)[i*2]);
+                    __stcs(&block_C_thread[M/8], ((int4*)d_bf16)[i*2+1]);
                     block_C_thread += (32*M)/8;
                 }
+                return;
             }
         }
     }
+
     // this made me waste 3++ hours of debugging and miss a party... :(
     asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
 }

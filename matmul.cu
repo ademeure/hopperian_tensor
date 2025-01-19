@@ -148,7 +148,7 @@ __global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, bf16 *matI, uns
     if (diff > 0.1) {
       // accept result if it looks like RELU
       if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f) {
-        printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %zu (with I: %5.7f)\n", ref_with_added, (float)matOut[i], diff, i, (float)matI[i]);
+        //printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d (with I: %5.7f)\n", ref_with_added, (float)matOut[i], diff, (int)i, (float)matI[i]);
         *error = 1;
       }
     }
@@ -202,7 +202,7 @@ int main() {
 
   bool first_run = true;
   bool run_verif = RUN_VERIF;
-  for (int kernel_num : {10,10,10}) {
+  for (int kernel_num : {10}) {
     printf("\nKERNEL %d\n", kernel_num);
 
     if (!first_run) {
