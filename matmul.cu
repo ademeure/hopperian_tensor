@@ -142,13 +142,13 @@ __global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, bf16 *matI, uns
   }
 */
 
-  if (i < N/2) {
+  if (i < N) {
     float ref_with_added = (float)((bf16)(((float)matRef[i] + (float)matI[i])));
     float diff = fabs(ref_with_added - (float)matOut[i]);
     if (diff > 0.1) {
       // accept result if it looks like RELU
       if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f) {
-        printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d (with I: %5.7f)\n", ref_with_added, (float)matOut[i], diff, i, (float)matI[i]);
+        printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %zu (with I: %5.7f)\n", ref_with_added, (float)matOut[i], diff, i, (float)matI[i]);
         *error = 1;
       }
     }
@@ -175,6 +175,7 @@ int main() {
   unsigned int* scalar_gpu;
   unsigned int scalar_host;
   cudaMalloc((void**)&scalar_gpu, sizeof(unsigned int));
+  cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
   cudaCheck(cudaMalloc((void **)&dA, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dB, sizeof(bf16) * max_size * max_size));
   cudaCheck(cudaMalloc((void **)&dC, sizeof(bf16) * max_size * max_size));
@@ -201,7 +202,7 @@ int main() {
 
   bool first_run = true;
   bool run_verif = RUN_VERIF;
-  for (int kernel_num : {10}) {
+  for (int kernel_num : {10,10,10}) {
     printf("\nKERNEL %d\n", kernel_num);
 
     if (!first_run) {
