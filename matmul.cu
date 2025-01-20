@@ -6,7 +6,7 @@
 
 #define ENABLE_CUBLAS
 #define ENABLE_RANDOM
-//#define ENABLE_TRUE_RANDOM
+#define ENABLE_TRUE_RANDOM
 #define SLEEP_BETWEEN_KERNELS_SEC 1 // optional rest to avoid thermal throttling between kernels
 #define REFERENCE_KERNEL 0
 constexpr bool RUN_VERIF = true;
@@ -143,13 +143,34 @@ __global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, bf16 *matI, uns
 */
 
   if (i < N) {
-    float ref_with_added = (float)((bf16)(((float)matRef[i] + (float)matI[i])));
+    float ref_with_added = (float)((bf16)(((float)matRef[i] + (float)0)));
     float diff = fabs(ref_with_added - (float)matOut[i]);
     if (diff > 0.1) {
       // accept result if it looks like RELU
       if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f) {
         //printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d (with I: %5.7f)\n", ref_with_added, (float)matOut[i], diff, (int)i, (float)matI[i]);
-        *error = 1;
+        int x_base = i % max_size;
+        int y_base = (i / max_size);
+        if (x_base % 256 == 0 && y_base % 256 == 0) {
+          // calculate absmax for the tile
+          // (this is... not maximally efficient)
+          float absmax = 0.0f;
+          for (int x = 0; x < 256; x++) {
+            for (int y = 0; y < 256; y++) {
+              int idx = (x + x_base) + (y + y_base) * max_size;
+              float ref_with_added = (float)((bf16)(((float)matRef[idx] + (float)0)));
+              absmax = max(absmax, fabsf(ref_with_added));
+            }
+          }
+          bf16 absmax_bf16 = (bf16)absmax;
+          printf("absmax: %5.20f vs claimed_absmax: %5.20f\n", (float)absmax_bf16, (float)matOut[i]);
+          diff = fabsf((float)absmax_bf16 - (float)matOut[i]);
+          if (diff > 0.1) {
+            *error = 1;
+          }
+        } else {
+          *error = 1;
+        }
       }
     }
   }

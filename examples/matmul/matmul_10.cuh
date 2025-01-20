@@ -1,5 +1,5 @@
-constexpr bool ENABLE_C_INPUT = true;
-
+constexpr bool ENABLE_C_INPUT = false;
+constexpr float ENABLE_ABSMAX_SCALING = 1.0f;
 namespace M10 {
 
 CUtensorMap d_tma_map_A, d_tma_map_B, d_tma_map_C, d_tma_map_I;
@@ -135,7 +135,7 @@ __device__ static inline void load_async_multicast(uint32_t dst_ptr, void const*
     uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
     asm volatile (
         "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
-        " [%0], [%1, {%3, %4, %5}], [%2], %6;"
+        " [%0], [%1, {%3, %4, %5}], [%2], %6;\n"
         :: "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), "h"(cluster_mask) : "memory"
     );
 }
@@ -145,30 +145,30 @@ __device__ static void wait(uint32_t mbar_ptr, int kPhaseBit) {
     // slight variants (e.g. branch to DONE on @P then unconditionally to LAB_WAIT) result in different code
     // not obvious what's best in the general case or why the compiler acts the way it does, but good enough (for now)
     asm volatile (
-        "{\n"
-        ".reg .pred P;\n"
-        "RETRY:\n"
-        "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n"
+        "{\n\t"
+        ".reg .pred P;\n\t"
+        "RETRY:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P, [%0], %1;\n\t"
         "@!P bra.uni RETRY;\n"
         "}\n" :: "r"(mbar_ptr), "r"(kPhaseBit));
 }
 
 __device__ static void arrive_cluster(uint32_t mbar_ptr, uint32_t cta_id, uint32_t count=1) {
     asm volatile(
-        "{\n"
+        "{\n\t"
         ".reg .b32 remAddr32;\n\t"
         "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
-        "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n\t"
+        "mbarrier.arrive.shared::cluster.b64  _, [remAddr32], %2;\n"
         "}" :: "r"(mbar_ptr), "r"(cta_id), "r"(count));
 }
 
 __device__ static void elect_or_exit() {
     // to help the compiler not be silly... (threadIdx.x == constant should be enough, come on guys!)
     asm volatile (
-        "{\n"
-        ".reg .pred P;\n"
-        "elect.sync _|P, 0xFFFFFFFF;\n"
-        "@!P exit;"
+        "{\n\t"
+        ".reg .pred P;\n\t"
+        "elect.sync _|P, 0xFFFFFFFF;\n\t"
+        "@!P exit;\n\t"
         "}\n" :: );
 }
 
@@ -218,11 +218,16 @@ struct Schedule<1, NUM_SM, BM, BN, TM, TN, CLUSTER_M> {
 
 template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
-    alignas(128) bf16 A[BM*BK*QSIZE];
-    alignas(128) bf16 B[BK*BN*QSIZE];
-    alignas(128) bf16 C[BN*BM/2];
+    alignas(1024) bf16 A[BM*BK*QSIZE];
+    alignas(1024) bf16 B[BK*BN*QSIZE];
+    alignas(1024) bf16 C[BN*BM/2];
+    // mbarriers
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
-    alignas(8) ushort4 tileinfo[4];
+    alignas(8) uint64_t absmax_barrier;
+    // metadata shared across cluster
+    alignas(16) ushort4 tileinfo[4];
+    alignas(16) float absmax_local_warp[8];
+    alignas(16) float absmax_cluster_warpgroup[4];
 };
 
 #define FULL_PTR(i) (full_start + i*8)
@@ -241,13 +246,14 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     extern __shared__ __align__(128) uint8_t smem[];
     SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
     bf16 *sA = s.A, *sB = s.B, *sC = s.C;
-    uint64_t *full = s.full, *empty = s.empty;
+    uint64_t *full = s.full, *empty = s.empty, *absmax_barrier = &s.absmax_barrier;
 
     if (threadIdx.x == 0) {
         for (int i = 0; i < QSIZE; ++i) {
             init_barrier(&full[i], 1);
             init_barrier(&empty[i], num_consumers*CLUSTERS);
         }
+        init_barrier(absmax_barrier, num_consumers*CLUSTERS);
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -268,12 +274,14 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     constexpr uint32_t sC_base = sB_base + sizeof(s.B);
     constexpr uint32_t full_base = sC_base + sizeof(s.C);
     constexpr uint32_t empty_base = full_base + sizeof(s.full);
+    constexpr uint32_t absmax_base = empty_base + sizeof(s.empty);
 
     uint32_t sA_start = sA_base + cluster_rank * 0x1000000;
     uint32_t sB_start = sB_base + cluster_rank * 0x1000000;
     uint32_t sC_start = sC_base + cluster_rank * 0x1000000;
     uint32_t full_start = full_base + cluster_rank * 0x1000000;
     uint32_t empty_start = empty_base + cluster_rank * 0x1000000;
+    uint32_t absmax_barrier_start = absmax_base + cluster_rank * 0x1000000;
 
     const int num_blocks_k = K / BK;
     int block_m, block_n;
@@ -289,7 +297,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         elect_or_exit();
         int p = 0, qidx = 0;
 
-        if (threadIdx.x == 64) {
+        if (threadIdx.x == 0) {
             if (cluster_rank == 0) {
                 Schedule<1, NUM_SM/CLUSTERS, BM*CLUSTERS, BN, 16/CLUSTERS, 8, CLUSTERS> schedule(M, N, cluster_rank, cluster_id, counter);
                 schedule_next = schedule.next(block_m, block_n);
@@ -299,7 +307,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     asm volatile("mapa.shared::cluster.u64  %0, %1, %2;\n\t" : "=l"(tileinfo_ptr[c]) : "l"(s.tileinfo), "r"(c));
                     tileinfo_ptr[c][0] = make_ushort4(block_m, block_n, schedule_next, 0);
                 }
-                asm volatile("barrier.cluster.arrive;\n" : :);
+                asm volatile("barrier.cluster.arrive;\n" ::);
 
                 while (schedule_next) {
                     asm volatile("barrier.sync 8, 64;\n" ::);
@@ -312,7 +320,10 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             } else {
                 asm volatile("barrier.cluster.arrive;\n" : :);
             }
-        } else if (threadIdx.x == 0) {
+        } else if (threadIdx.x == 32) {
+            for (int i = 0; i < num_consumers * CLUSTERS; i++) {
+                s.absmax_cluster_warpgroup[i] = -1.0f; // init to impossible value so we can spinlock until it's set
+            }
             asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
             ushort4 tileinfo = s.tileinfo[0];
             block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
@@ -409,7 +420,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     }
                 }
             }
-        } else if (threadIdx.x == 32) {
+        } else if (threadIdx.x == 64) {
             asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
             ushort4 tileinfo = s.tileinfo[0];
             block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
@@ -477,6 +488,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         int previous_block_m = -1, previous_block_n = -1; // for debugging only at the moment
 
         while (schedule_next) {
+            int absmax_bf16_vec2 = 0;
             constexpr int post_process_iterations = 8;
             constexpr int write_iterations = 4;
             constexpr int unrolled_iterations = 12; //post_process_iterations + write_iterations;
@@ -532,7 +544,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                             int data = block_sC_32b[idx_32b + k*16];
 
                             if constexpr (SQUARED) {
-                                asm volatile("fma.rn.bf16x2 %0, %1, %1, %2;" : "=r"(data) : "r"(data), "r"(0));
+                                asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(data) : "r"(data), "r"(data), "r"(0));
                             }
 
                             d_bf16[i*2+0][k] = ((bf16*)&data)[0];
@@ -541,6 +553,13 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                             if constexpr (ENABLE_C_INPUT) {
                                 d_bf16[i*2+0][k] = (bf16)((float)d_bf16[i*2+0][k] + (float)((bf16*)&input0)[k]);
                                 d_bf16[i*2+1][k] = (bf16)((float)d_bf16[i*2+1][k] + (float)((bf16*)&input1)[k]);
+                            }
+
+                            if constexpr (ENABLE_ABSMAX_SCALING) {
+                                if (k % 2) {
+                                    asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_bf16[i*2+0][k-1])));
+                                    asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_bf16[i*2+1][k-1])));
+                                }
                             }
 
                             /*
@@ -557,15 +576,55 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                             */
                         }
 
+                        if constexpr (ENABLE_ABSMAX_SCALING) {
+                            if (i == 7) {
+                                bf16* absmax_bf16_ptr = (bf16*)&absmax_bf16_vec2;
+                                float absmax = max(fabsf(absmax_bf16_ptr[0]), fabsf(absmax_bf16_ptr[1]));
+                                asm volatile("redux.sync.max.u32 %0, %1, 0xff;" : "=r"(*((int*)&absmax)) : "r"(*((int*)&absmax)));
+
+                                uint32_t laneid;
+                                asm volatile("mov.u32 %0, %laneid;\n" : "=r"(laneid) :);
+                                if (laneid == 0) {
+                                    s.absmax_local_warp[threadIdx.x / 32 - 4] = absmax;
+                                }
+
+                                asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                                if (tid < CLUSTERS) {
+                                    absmax = max(absmax, s.absmax_local_warp[1 + 4 * wg_idx]);
+                                    absmax = max(absmax, s.absmax_local_warp[2 + 4 * wg_idx]);
+                                    absmax = max(absmax, s.absmax_local_warp[3 + 4 * wg_idx]);
+                                    uint32_t ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&s.absmax_cluster_warpgroup[wg_idx + cluster_rank * num_consumers]));
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b32 remAddr32;\n\t"
+                                        "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+                                        "st.shared::cluster.f32 [remAddr32], %2;\n"
+                                        "}\n" :: "r"(ptr), "r"(tid), "f"(absmax));
+                                    arrive_cluster(absmax_barrier_start, tid);
+                                }
+                            }
+                        }
+
                         if constexpr (ENABLE_C_INPUT && DELAYED_WAIT > 0) {
                             asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx)); // TODO: when is this really required?
                         }
-
                     } else if (iter < post_process_iterations + write_iterations) {
                         int i = (iter - post_process_iterations) * (8 / write_iterations);
+                        float final_absmax;
+
+                        if constexpr (ENABLE_ABSMAX_SCALING) {
+                            if (i == 0) {
+                                wait(absmax_barrier_start, (tileinfo_idx & 1) ? 0 : 1);
+                                float4 absmax_all_warpgroups = *(float4*)s.absmax_cluster_warpgroup;
+                                final_absmax = max(absmax_all_warpgroups.x, max(absmax_all_warpgroups.y, max(absmax_all_warpgroups.z, absmax_all_warpgroups.w)));
+
+                                //int absmax_exponent;
+                                //asm volatile("bfe.u32 %0, %1, 23, 8;" : "=r"(absmax_exponent) : "r"(*(int*)&final_absmax)); // turns out bfe is legacy...
+                            }
+                        }
 
                         for (int j = 0; j < 8 / write_iterations; i++, j++) {
-                             __stcs(&block_C_thread[0],  ((int4*)d_bf16)[i*2]);
+                            __stcs(&block_C_thread[0],   ((int4*)d_bf16)[i*2]);
                             __stcs(&block_C_thread[M/8], ((int4*)d_bf16)[i*2+1]);
                             block_C_thread += (32*M)/8;
                         }
@@ -686,12 +745,14 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                         */
                     }
 
+                    // TODO: add absmax here too (really need to unify this code with the non-final-tile post-processing code)
                     asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
                     if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(qidx), tid);
                     if (++qidx == QSIZE) {qidx = 0; p ^= 1; };
 
-                    __stcs(&block_C_thread[0],   ((int4*)d_bf16)[i*2]);
-                    __stcs(&block_C_thread[M/8], ((int4*)d_bf16)[i*2+1]);
+                    // micro optimization: for the last tiles, we *want* them to stay in L2, so .wb is better than .cs
+                    __stwb(&block_C_thread[0],   ((int4*)d_bf16)[i*2]);
+                    __stwb(&block_C_thread[M/8], ((int4*)d_bf16)[i*2+1]);
                     block_C_thread += (32*M)/8;
                 }
                 return;
