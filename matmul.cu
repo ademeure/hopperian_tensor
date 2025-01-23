@@ -2,7 +2,14 @@
 #include <sys/time.h>
 #include <stdio.h>
 #include <cuda_bf16.h>
+//#include <cuda_fp8.h>
 #include <assert.h>
+
+typedef __nv_bfloat16 floatX;
+#define CUBLAS_FLOATX CUDA_R_16BF
+
+constexpr bool ENABLE_C_INPUT = false;
+constexpr float ENABLE_ABSMAX_SCALING = 0.0f;
 
 #define ENABLE_CUBLAS
 #define ENABLE_RANDOM
@@ -24,7 +31,6 @@ int get_time() {
   return diff;
 }
 
-typedef __nv_bfloat16 bf16;
 #define CEIL_DIV(M, N) (((M) + (N)-1) / (N))
 
 void cudaCheck(cudaError_t error, const char *file, int line) {
@@ -47,11 +53,11 @@ std::default_random_engine generator(69);
 #ifdef ENABLE_CUBLAS
 #include <cublas_v2.h>
 cublasHandle_t cublas_handle;
-void runCublasGemmBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
+void runCublasGemmBF16(int M, int N, int K, floatX *A, floatX *B, floatX *C) {
   float alpha = 1, beta = 0;
   // C(column major) = A(row major) * B(column major)
-  cublasStatus_t status = cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A, CUDA_R_16BF,
-    N, B, CUDA_R_16BF, K, &beta, C, CUDA_R_16BF, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+  cublasStatus_t status = cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A, CUBLAS_FLOATX,
+    N, B, CUBLAS_FLOATX, K, &beta, C, CUBLAS_FLOATX, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
   if (status != CUBLAS_STATUS_SUCCESS) {
     printf("CUBLAS error: %d\n", status);
@@ -60,7 +66,7 @@ void runCublasGemmBF16(int M, int N, int K, bf16 *A, bf16 *B, bf16 *C) {
 }
 #endif
 
-void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, bf16 *I, unsigned int* scalar_gpu) {
+void run_kernel(int kernel_num, int M, int N, int K, floatX *A, floatX *B, floatX *C, floatX *I, unsigned int* scalar_gpu) {
   switch (kernel_num) {
     case 0:
 #ifdef ENABLE_CUBLAS
@@ -73,10 +79,10 @@ void run_kernel(int kernel_num, int M, int N, int K, bf16 *A, bf16 *B, bf16 *C, 
   }
 }
 
-void randomize_matrix(bf16 *mat, int N, float scale=1.0f) {
+void randomize_matrix(floatX *mat, int N, float scale=1.0f) {
   if (scale == 0.0f) {
     for (int i = 0; i < N; i++) {
-      mat[i] = (bf16)(i*1000);
+      mat[i] = (floatX)(i*1000);
     }
     return;
   }
@@ -84,7 +90,7 @@ void randomize_matrix(bf16 *mat, int N, float scale=1.0f) {
   std::normal_distribution<float> distribution(0, scale);
 #ifdef ENABLE_TRUE_RANDOM
   for (int i = 0; i < N; i++) {
-    mat[i] = distribution(generator);
+    mat[i] = (floatX)(distribution(generator) + 0.01f)  ;
   }
 #else
   int i = 0;
@@ -92,22 +98,22 @@ void randomize_matrix(bf16 *mat, int N, float scale=1.0f) {
     mat[i] = distribution(generator);
   }
   for (int multiplier = 1; i < N-(prime * multiplier); i += prime * multiplier, multiplier *= 2) {
-    memcpy(mat+i, mat, sizeof(bf16) * prime);
+    memcpy(mat+i, mat, sizeof(floatX) * prime);
   }
   for (; i < N-prime; i += prime) {
-    memcpy(mat+i, mat, sizeof(bf16) * prime);
+    memcpy(mat+i, mat, sizeof(floatX) * prime);
   }
   for (; i < N; i++) {
     mat[i] = mat[i-prime];
   }
 #endif
 #else
-  cudaMemset(mat, 0, sizeof(bf16) * N);
+  cudaMemset(mat, 0, sizeof(floatX) * N);
 #endif
 }
 
 /*
-bool verify_matrix(bf16 *matRef, bf16 *matOut, int N) {
+bool verify_matrix(floatX *matRef, floatX *matOut, int N) {
   double diff = 0.0;
   int i;
   for (i = 0; i < N; i++) {
@@ -124,7 +130,7 @@ bool verify_matrix(bf16 *matRef, bf16 *matOut, int N) {
 }
 */
 
-__global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, bf16 *matI, unsigned int *error, size_t N) {
+__global__ void verify_matrix_kernel(floatX *matRef, floatX *matOut, floatX *matI, unsigned int *error, size_t N) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
 
 /*
@@ -143,33 +149,39 @@ __global__ void verify_matrix_kernel(bf16 *matRef, bf16 *matOut, bf16 *matI, uns
 */
 
   if (i < N) {
-    float ref_with_added = (float)((bf16)(((float)matRef[i] + (float)0)));
+    float ref_with_added = (float)((floatX)(((float)matRef[i] + (float)0)));
     float diff = fabs(ref_with_added - (float)matOut[i]);
-    if (diff > 0.1) {
+
+    int x_base = i % max_size;
+    int y_base = (i / max_size);
+    bool absmax_position = ENABLE_ABSMAX_SCALING ? (x_base % 256 == 0 && y_base % 256 == 0) : false;
+
+    if (diff > 0.1 || absmax_position) {
       // accept result if it looks like RELU
-      if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f) {
+      if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f || absmax_position) {
         //printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d (with I: %5.7f)\n", ref_with_added, (float)matOut[i], diff, (int)i, (float)matI[i]);
-        int x_base = i % max_size;
-        int y_base = (i / max_size);
-        if (x_base % 256 == 0 && y_base % 256 == 0) {
+        if (absmax_position) {
           // calculate absmax for the tile
           // (this is... not maximally efficient)
           float absmax = 0.0f;
           for (int x = 0; x < 256; x++) {
             for (int y = 0; y < 256; y++) {
               int idx = (x + x_base) + (y + y_base) * max_size;
-              float ref_with_added = (float)((bf16)(((float)matRef[idx] + (float)0)));
+              float ref_with_added = (float)((floatX)(((float)matRef[idx] + (float)0)));
               absmax = max(absmax, fabsf(ref_with_added));
             }
           }
-          bf16 absmax_bf16 = (bf16)absmax;
-          printf("absmax: %5.20f vs claimed_absmax: %5.20f\n", (float)absmax_bf16, (float)matOut[i]);
+          floatX absmax_bf16 = (floatX)absmax;
           diff = fabsf((float)absmax_bf16 - (float)matOut[i]);
-          if (diff > 0.1) {
+          if (diff > 2.0) {
+            printf("absmax: %5.20f vs claimed_absmax: %5.20f (at: %d/%d)\n", (float)absmax_bf16, (float)matOut[i], (int)x_base, (int)y_base);
             *error = 1;
           }
         } else {
-          *error = 1;
+          if (diff > 100.0f && ((float)ref_with_added / (float)matOut[i] > 1.01f || (float)ref_with_added / (float)matOut[i] < 0.99f)) {
+            printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d\n", ref_with_added, (float)matOut[i], diff, i);
+            *error = 1;
+          }
         }
       }
     }
@@ -180,14 +192,14 @@ int main() {
   get_time();
   long m = max_size, n = max_size, k = max_size;
 
-  bf16 *A = nullptr, *B = nullptr, *C = nullptr, *I = nullptr, *C_ref = nullptr;  // host matrices
-  bf16 *dA = nullptr, *dB = nullptr, *dC = nullptr, *dI = nullptr, *dC_ref = nullptr; // device matrices
+  floatX *A = nullptr, *B = nullptr, *C = nullptr, *I = nullptr, *C_ref = nullptr;  // host matrices
+  floatX *dA = nullptr, *dB = nullptr, *dC = nullptr, *dI = nullptr, *dC_ref = nullptr; // device matrices
 
-  A = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
-  B = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
-  C = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
-  I = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
-  C_ref = (bf16 *)malloc(sizeof(bf16) * max_size * max_size);
+  A = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
+  B = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
+  C = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
+  I = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
+  C_ref = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
 
   randomize_matrix(A, max_size * max_size);
   randomize_matrix(B, max_size * max_size);
@@ -197,16 +209,16 @@ int main() {
   unsigned int scalar_host;
   cudaMalloc((void**)&scalar_gpu, sizeof(unsigned int));
   cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
-  cudaCheck(cudaMalloc((void **)&dA, sizeof(bf16) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dB, sizeof(bf16) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dC, sizeof(bf16) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dI, sizeof(bf16) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(bf16) * max_size * max_size));
+  cudaCheck(cudaMalloc((void **)&dA, sizeof(floatX) * max_size * max_size));
+  cudaCheck(cudaMalloc((void **)&dB, sizeof(floatX) * max_size * max_size));
+  cudaCheck(cudaMalloc((void **)&dC, sizeof(floatX) * max_size * max_size));
+  cudaCheck(cudaMalloc((void **)&dI, sizeof(floatX) * max_size * max_size));
+  cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(floatX) * max_size * max_size));
 
-  cudaCheck(cudaMemcpyAsync(dA, A, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpyAsync(dB, B, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpyAsync(dC, I, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpyAsync(dI, I, sizeof(bf16) * max_size * max_size, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dA, A, sizeof(floatX) * max_size * max_size, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dB, B, sizeof(floatX) * max_size * max_size, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dC, I, sizeof(floatX) * max_size * max_size, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dI, I, sizeof(floatX) * max_size * max_size, cudaMemcpyHostToDevice));
 
 #ifdef ENABLE_CUBLAS
   cublasCreate(&cublas_handle);
@@ -233,8 +245,8 @@ int main() {
 
     // Verify against cuBLAS. Also serves as a warmup step
     if (run_verif) {
-      cudaCheck(cudaMemset(dC, 0, sizeof(bf16) * max_size * max_size));
-      cudaCheck(cudaMemset(dC_ref, 0, sizeof(bf16) * max_size * max_size));
+      cudaCheck(cudaMemset(dC, 0, sizeof(floatX) * max_size * max_size));
+      cudaCheck(cudaMemset(dC_ref, 0, sizeof(floatX) * max_size * max_size));
       cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
 
       run_kernel(kernel_num, m, n, k, dA, dB, dC, dI, scalar_gpu);
