@@ -489,6 +489,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
             }
         } else if (threadIdx.x == 96) {
+            /*
             asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
             ushort4 tileinfo = s.tileinfo[0];
             block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
@@ -505,6 +506,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 ushort4 tileinfo = s.tileinfo[++tileinfo_idx % 4];
                 block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
             }
+            */
         }
     } else {
         asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
@@ -564,7 +566,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             for (int iter = 0; iter < unrolled_iterations; iter++) {
                 if (iter > 0) {
                     warpgroup_wait<0>();
-                    asm volatile("barrier.arrive 14, 288;\n" ::);
+                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((iter+3) & 3)), tid);
+                    //asm volatile("barrier.arrive 14, 288;\n" ::);
                 }
 
                 warpgroup_arrive();
@@ -721,7 +724,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 #pragma unroll 1
                 for (int block_k_iter = unrolled_iterations; block_k_iter < num_blocks_k; block_k_iter++) {
                     warpgroup_wait<0>();
-                    asm volatile("barrier.arrive 14, 288;\n" ::);
+                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((block_k_iter+3) & 3)), tid);
                     asm volatile("barrier.sync 5, 160;\n" ::: "memory");
 
                     for(int n_tile = 0; n_tile < 16; n_tile++) {
@@ -743,7 +746,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 #pragma unroll 1
                 for (int block_k_iter = unrolled_iterations; block_k_iter < num_blocks_k; block_k_iter++) {
                     warpgroup_wait<0>();
-                    asm volatile("barrier.arrive 14, 288;\n" ::);
+                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((block_k_iter+3) & 3)), tid);
                     asm volatile("barrier.sync 6, 160;\n" ::: "memory");
 
                     for(int n_tile = 0; n_tile < 16; n_tile++) {
@@ -774,7 +777,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
 
             warpgroup_wait<0>();
-            asm volatile("barrier.arrive 14, 288;\n" ::);
+            if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(3), tid);
+            //asm volatile("barrier.arrive 14, 288;\n" ::);
 
             for(int n_tile = 0; n_tile < 16; n_tile++) {
                 if constexpr (RELU) {
