@@ -1,10 +1,8 @@
-//constexpr bool ENABLE_C_INPUT = false;
-//constexpr float ENABLE_ABSMAX_SCALING = 1.0f;
-
-#define WGMMA_INSTRUCTION "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16"
-#define CU_TENSOR_FLOATX CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
-
 namespace M10 {
+
+constexpr int post_process_iterations = 4;
+constexpr int write_iterations = 1;
+constexpr int unrolled_iterations = post_process_iterations + write_iterations;
 
 CUtensorMap d_tma_map_A, d_tma_map_B, d_tma_map_C, d_tma_map_I;
 int _prev_m=0, _prev_n=0, _prev_k=0;
@@ -25,19 +23,20 @@ __device__ void warpgroup_wait() {
     asm volatile("wgmma.wait_group.sync.aligned %0;\n" ::"n"(N) : "memory");
 }
 
-template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true>
+template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true, typename T=floatX>
 __host__ static inline CUtensorMap create_tensor_map(void* gmem_ptr, int global_height, int global_width) {
     CUtensorMap tma_map;
     void* gmem_address = (void*)gmem_ptr;
-    static_assert(BlockMinorSize >= 64);
-    assert(global_width % 64 == 0);
-    uint64_t gmem_prob_shape[5] = {64, (uint64_t)global_height, (uint64_t)global_width/64, 1, 1};
-    uint64_t gmem_prob_stride[5] = {sizeof(floatX) * global_width, 64*sizeof(floatX), 0, 0, 0};
-    uint32_t smem_box_shape[5] = {64, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/64), 1, 1};
+    constexpr size_t MAGIC_VALUE = 128/sizeof(T);
+    static_assert(BlockMinorSize >= MAGIC_VALUE);
+    assert(global_width % MAGIC_VALUE == 0);
+    uint64_t gmem_prob_shape[5] = {MAGIC_VALUE, (uint64_t)global_height, (uint64_t)global_width/MAGIC_VALUE, 1, 1};
+    uint64_t gmem_prob_stride[5] = {sizeof(T) * global_width, MAGIC_VALUE*sizeof(T), 0, 0, 0};
+    uint32_t smem_box_shape[5] = {MAGIC_VALUE, uint32_t(BlockMajorSize), uint32_t(BlockMinorSize/MAGIC_VALUE), 1, 1};
     uint32_t smem_box_stride[5] = {1, 1, 1, 1, 1};
 
     CUresult result = cuTensorMapEncodeTiled(
-        &tma_map, CU_TENSOR_FLOATX, 3, gmem_address, gmem_prob_shape,
+        &tma_map, std::is_same<T, floatX>::value ? CU_TENSOR_FLOATX : CU_TENSOR_FLOATP, 3, gmem_address, gmem_prob_shape,
         gmem_prob_stride, smem_box_shape, smem_box_stride, CU_TENSOR_MAP_INTERLEAVE_NONE,
         swizzle ? CU_TENSOR_MAP_SWIZZLE_128B : CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
 
@@ -69,9 +68,12 @@ __device__ __forceinline__ void wgmma256(float d[16][8], uint64_t desc_a, uint64
         " %104, %105, %106, %107, %108, %109, %110, %111,  "
         " %112, %113, %114, %115, %116, %117, %118, %119,  "
         " %120, %121, %122, %123, %124, %125, %126, %127},"
-        " %128,"
-        " %129,"
-        " %130,    %131,  %132,  %133,  %134;\n"
+        " %128, %129,"
+#ifdef FP8
+        " %130, %131, %132;\n"
+#else
+        " %130, %131, %132, %133, %134;\n"
+#endif
         "}\n"
         :   "+f"(d[0][0]), "+f"(d[0][1]), "+f"(d[0][2]), "+f"(d[0][3]), "+f"(d[0][4]), "+f"(d[0][5]), "+f"(d[0][6]), "+f"(d[0][7]),
             "+f"(d[1][0]), "+f"(d[1][1]), "+f"(d[1][2]), "+f"(d[1][3]), "+f"(d[1][4]), "+f"(d[1][5]), "+f"(d[1][6]), "+f"(d[1][7]),
@@ -89,8 +91,12 @@ __device__ __forceinline__ void wgmma256(float d[16][8], uint64_t desc_a, uint64
             "+f"(d[13][0]), "+f"(d[13][1]), "+f"(d[13][2]), "+f"(d[13][3]), "+f"(d[13][4]), "+f"(d[13][5]), "+f"(d[13][6]), "+f"(d[13][7]),
             "+f"(d[14][0]), "+f"(d[14][1]), "+f"(d[14][2]), "+f"(d[14][3]), "+f"(d[14][4]), "+f"(d[14][5]), "+f"(d[14][6]), "+f"(d[14][7]),
             "+f"(d[15][0]), "+f"(d[15][1]), "+f"(d[15][2]), "+f"(d[15][3]), "+f"(d[15][4]), "+f"(d[15][5]), "+f"(d[15][6]), "+f"(d[15][7])
-        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
-            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+        : "l"(desc_a), "l"(desc_b),
+#ifdef FP8
+        "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)));
+#else
+        "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)), "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
+#endif
 }
 
 template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
@@ -125,13 +131,14 @@ __device__ static void expect_bytes(uint32_t mbar_ptr, uint32_t bytes) {
     asm volatile ("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(mbar_ptr), "r"(bytes));
 }
 
+template<typename T=floatX>
 __device__ static void load_async(uint32_t dst_ptr, void const* src_tma_map, uint32_t mbar_ptr, int global_col_idx, int global_row_idx) {
     // TODO: Support "streaming" cache policy (for C/I)
     uint64_t tma_ptr  = reinterpret_cast<uint64_t>(src_tma_map);
     asm volatile (
         "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes"
         " [%0], [%1, {%3, %4, %5}], [%2];\n"
-        :: "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx/64) : "memory"
+        :: "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx/(128/(int)sizeof(T))) : "memory"
     );
 }
 
@@ -140,7 +147,7 @@ __device__ static inline void load_async_multicast(uint32_t dst_ptr, void const*
     asm volatile (
         "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster"
         " [%0], [%1, {%3, %4, %5}], [%2], %6;\n"
-        :: "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx/64), "h"(cluster_mask) : "memory"
+        :: "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx/(128/(int)sizeof(floatX))), "h"(cluster_mask) : "memory"
     );
 }
 
@@ -226,7 +233,8 @@ struct SMem {
     alignas(1024) floatX B[BK*BN*QSIZE];
     alignas(1024) floatP C[BN*BM/2];
     // mbarriers
-    alignas(8) uint64_t full[QSIZE], empty[QSIZE];
+    alignas(8) uint64_t full[QSIZE];
+    alignas(8) uint64_t empty[QSIZE];
     alignas(8) uint64_t absmax_barrier;
     // metadata shared across cluster
     alignas(16) ushort4 tileinfo[4];
@@ -234,18 +242,18 @@ struct SMem {
     alignas(16) float absmax_cluster_warpgroup[4];
 };
 
-#define FULL_PTR(i) (full_start + i*8)
-#define EMPTY_PTR(i) (empty_start + i*8)
-#define SA_PTR(i) (sA_start + i*BK*BM*sizeof(floatX))
-#define SB_PTR(i) (sB_start + i*BK*BN*sizeof(floatX))
-#define SC_PTR(i) (sC_start + (i*BM*BN*sizeof(floatP))/8)
+#define FULL_PTR(i) (full_start + (i)*8)
+#define EMPTY_PTR(i) (empty_start + (i)*8)
+#define SA_PTR(i) (sA_start + (i)*BK*BM*sizeof(floatX))
+#define SB_PTR(i) (sB_start + (i)*BK*BN*sizeof(floatX))
+#define SC_PTR(i) (sC_start + ((i)*BM*BN*sizeof(floatP))/8)
 
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTERS, bool RELU=false, bool SQUARED=false>
-__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, floatP* C, floatX* D, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapI, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counter) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, floatP* C, floatP* D, const __grid_constant__ CUtensorMap tensorMapI, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counter) {
     constexpr int MULTIPLE_EVERY_DIMENSON = 256;
     constexpr int MINIMUM_K_ITERATIONS = MULTIPLE_EVERY_DIMENSON / BK;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1; // == 2
-    constexpr int WGMMA_M = 64, WGMMA_K = 16, WGMMA_N=BN;
+    constexpr int WGMMA_M = 64, WGMMA_N=BN, WGMMA_K = (sizeof(floatX) == 1 ? 32 : 16);
 
     extern __shared__ __align__(128) uint8_t smem[];
     SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
@@ -344,12 +352,13 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     int block_k_iter = 0;
                     if constexpr (ENABLE_C_INPUT) {
                         if (!first) {
+                            #pragma unroll 1
                             for (; block_k_iter < 8; block_k_iter++) {
                                 wait(EMPTY_PTR(qidx), p);
-                                expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(floatX));
+                                expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM)*sizeof(floatX) + (BM*BN/8)*sizeof(floatP));
                                 load_async_multicast(SB_PTR(qidx), &tensorMapB, FULL_PTR(qidx), block_k_iter*BK, block_n*BN, multicast_mask);
                                 load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
-                                load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
+                                load_async<floatP>(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
 
                                 if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
                                 //__nanosleep(128);
@@ -359,7 +368,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
                     #pragma unroll 1
                     for (; block_k_iter < num_blocks_k;) {
-                        #pragma unroll 2
+                        #pragma unroll 1
                         for (int j = 0; j < MINIMUM_K_ITERATIONS; j++, block_k_iter++) {
                             wait(EMPTY_PTR(qidx), p);
                             expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM)*sizeof(floatX));
@@ -379,11 +388,12 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     int block_k_iter = 0;
                     if constexpr (ENABLE_C_INPUT) {
                         if (!first) {
+                            #pragma unroll 1
                             for (; block_k_iter < 8; block_k_iter++) {
                                 wait(EMPTY_PTR(qidx), p);
-                                expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(floatX));
+                                expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM)*sizeof(floatX) + (BM*BN/8)*sizeof(floatP));
                                 load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
-                                load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
+                                load_async<floatP>(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
 
                                 if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
                                 //__nanosleep(128);
@@ -393,7 +403,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
                     #pragma unroll 1
                     for (; block_k_iter < num_blocks_k;) {
-                        #pragma unroll 2
+                        #pragma unroll 1
                         for (int j = 0; j < MINIMUM_K_ITERATIONS; j++, block_k_iter++) {
                             wait(EMPTY_PTR(qidx), p);
                             expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM)*sizeof(floatX));
@@ -411,10 +421,11 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             if constexpr (ENABLE_C_INPUT) {
                 if (!first) {
                     // TODO: all of A/B for that qidx is free by this point; so we could theoretically do it in a single step
+                    #pragma unroll 1
                     for (int i = 0; i < 8; i++) {
                         wait(EMPTY_PTR(qidx), p);
-                        expect_bytes(FULL_PTR(qidx), (BM*BN/8)*sizeof(floatX));
-                        load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + i*BN/8);
+                        expect_bytes(FULL_PTR(qidx), (BM*BN/8)*sizeof(floatP));
+                        load_async<floatP>(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + i*BN/8);
                         if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
                     }
                 }
@@ -519,7 +530,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         int4* out1[4] = { &block_sC_128b[idx + 128], &block_sC_128b[idx + 640], &block_sC_128b[idx + 1152], &block_sC_128b[idx + 1664] };
 
         int desc_id = wg_idx * QSIZE;
-        constexpr __int128 desc_multiplier = ((__int128)0x2 << (__int128)64) | (__int128)0x2;
+        constexpr __int128 desc_multiplier = ((__int128)2 << (__int128)64) | (__int128)2;
+        constexpr __int128 desc_large_multiplier = ((__int128)(8*BN) << (__int128)64) | (__int128)(8*BM); // TODO: BK=128 doesn't work and I don't know why
 
         int x = ((threadIdx.x % 8) * 8) + (threadIdx.x / 128 - 1) * 64;
         int y_base = ((threadIdx.x % 128) / 8) * 2;
@@ -537,15 +549,12 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
         while (schedule_next) {
             int absmax_bf16_vec2 = 0;
-            constexpr int post_process_iterations = 8;
-            constexpr int write_iterations = 4;
-            constexpr int unrolled_iterations = 12; //post_process_iterations + write_iterations;
 
             #pragma unroll
             for (int iter = 0; iter < unrolled_iterations; iter++) {
                 if (iter > 0) {
                     warpgroup_wait<0>();
-                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((iter+3) & 3)), tid);
+                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((iter+(QSIZE-1)) & (QSIZE-1))), tid);
                     //asm volatile("barrier.arrive 14, 288;\n" ::);
                 }
 
@@ -553,8 +562,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 asm volatile("barrier.sync %0, 160;\n" :: "r"(wg_idx+5));
                 if (iter == 0) wgmma<WGMMA_N, 0, 1, 1, 0, 0>(d, desc128);
                 else wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d, desc128);
-                for (int k_it = 1; k_it < 64/WGMMA_K; k_it++) {
-                    wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d, desc128 | (k_it * desc_multiplier));
+                for (int k_it = 1; k_it < BK/WGMMA_K; k_it++) {
+                    wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d, desc128 | ((k_it % 4) * desc_multiplier) | ((k_it / 4) * desc_large_multiplier));
                 }
                 warpgroup_commit_batch();
                 desc_id = next_desc_id[desc_id];
@@ -562,92 +571,96 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
                 if (output_to_gmem) {
                     if (iter < post_process_iterations) {
-                        int i = iter;
-
-                        int4 input0, input1;
-                        if constexpr (ENABLE_C_INPUT) {
-                            int address = (x%64)/8 + y_base*(64/8) + (x/64)*(64*32/8);
-                            int4 *input_base = (int4*)&sC[(i%4) * 512 * 8];
-                            input0 = input_base[address];
-                            input1 = input_base[address + 64/8];
-                            asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
-                        }
-
-                        int4 out0_data = ((int4*)d_x16)[i*2], out1_data = ((int4*)d_x16)[i*2+1];
-                        if (tid & 32) {
-                            out0_data = make_int4(out0_data.z, out0_data.w, out0_data.x, out0_data.y);
-                            out1_data = make_int4(out1_data.z, out1_data.w, out1_data.x, out1_data.y);
-                        }
-
-                        int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
-                        idx_32b += (i%4) * 2*WGMMA_M*BN / (8*2);
-                        idx_32b ^= (idx_32b & 128) ? 2 : 0;
-
-                        *out0[i%4] = out0_data, *out1[i%4] = out1_data;
-                        asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
-
-                        #pragma unroll 8
-                        for(int k = 0; k < 8; k++) {
-                            int data = block_sC_32b[idx_32b + k*16];
-
-                            if constexpr (SQUARED) {
-                                asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(data) : "r"(data), "r"(data), "r"(0));
+                        int i = iter * (8 / post_process_iterations);
+                        static_assert(!ENABLE_C_INPUT || post_process_iterations == 8);
+                        for (int j = 0; j < 8 / post_process_iterations; i++, j++) {
+                            int4 input0, input1;
+                            if constexpr (ENABLE_C_INPUT) {
+                                int address = (x%64)/8 + y_base*(64/8) + (x/64)*(64*32/8);
+                                int4 *input_base = (int4*)&sC[(i%4) * 512 * 8];
+                                input0 = input_base[address];
+                                input1 = input_base[address + 64/8];
+                                asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
                             }
 
-                            d_x16[i*2+0][k] = ((floatP*)&data)[0];
-                            d_x16[i*2+1][k] = ((floatP*)&data)[1];
+                            int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
+                            idx_32b += (i%4) * 2*WGMMA_M*BN / (8*2);
 
-                            if constexpr (ENABLE_C_INPUT) {
-                                d_x16[i*2+0][k] = (floatP)((float)d_x16[i*2+0][k] + (float)((floatX*)&input0)[k]);
-                                d_x16[i*2+1][k] = (floatP)((float)d_x16[i*2+1][k] + (float)((floatX*)&input1)[k]);
+                            int4 out0_data = ((int4*)d_x16)[i*2], out1_data = ((int4*)d_x16)[i*2+1];
+                            if constexpr (AVOID_SHARED_CONFLICTS) {
+                                if (tid & 32) {
+                                    out0_data = make_int4(out0_data.z, out0_data.w, out0_data.x, out0_data.y);
+                                    out1_data = make_int4(out1_data.z, out1_data.w, out1_data.x, out1_data.y);
+                                }
+                                idx_32b ^= (idx_32b & 128) ? 2 : 0;
+                            }
+
+                            *out0[i%4] = out0_data, *out1[i%4] = out1_data;
+                            asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+
+                            #pragma unroll 8
+                            for(int k = 0; k < 8; k++) {
+                                int data = block_sC_32b[idx_32b + k*16];
+
+                                if constexpr (SQUARED) {
+                                    asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(data) : "r"(data), "r"(data), "r"(0));
+                                }
+
+                                d_x16[i*2+0][k] = ((floatP*)&data)[0];
+                                d_x16[i*2+1][k] = ((floatP*)&data)[1];
+
+                                if constexpr (ENABLE_C_INPUT) {
+                                    d_x16[i*2+0][k] = (floatP)((float)d_x16[i*2+0][k] + (float)((floatX*)&input0)[k]);
+                                    d_x16[i*2+1][k] = (floatP)((float)d_x16[i*2+1][k] + (float)((floatX*)&input1)[k]);
+                                }
+
+                                if constexpr (ENABLE_ABSMAX_SCALING) {
+                                    if (k % 2) {
+                                        asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+0][k-1])));
+                                        asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+1][k-1])));
+                                    }
+                                }
+
+                                /*
+                                int data0 = data << 16;
+                                int data1 = data & 0xFFFF0000;
+                                float d0 = *(float*)&data0;
+                                float d1 = *(float*)&data1;
+
+                                // TODO: Elementwise processing here, e.g. GELU
+                                // this will require an additional BF16 input in cases like GELU backwards
+                                // and smart prefetching from memory with limited available register/smem/l2 space...
+                                data_bf16_col[0][k] = (floatP)max(0.0f, d0);
+                                data_bf16_col[1][k] = (floatP)max(0.0f, d1);
+                                */
                             }
 
                             if constexpr (ENABLE_ABSMAX_SCALING) {
-                                if (k % 2) {
-                                    asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+0][k-1])));
-                                    asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+1][k-1])));
-                                }
-                            }
+                                if (i == 7) {
+                                    floatP* absmax_bf16_ptr = (floatP*)&absmax_bf16_vec2;
+                                    float absmax = max(fabsf((float)absmax_bf16_ptr[0]), fabsf((float)absmax_bf16_ptr[1]));
+                                    asm volatile("redux.sync.max.u32 %0, %1, 0xff;" : "=r"(*((uint*)&absmax)) : "r"(*((uint*)&absmax)));
 
-                            /*
-                            int data0 = data << 16;
-                            int data1 = data & 0xFFFF0000;
-                            float d0 = *(float*)&data0;
-                            float d1 = *(float*)&data1;
+                                    uint32_t laneid;
+                                    asm volatile("mov.u32 %0, %laneid;\n" : "=r"(laneid) :);
+                                    if (laneid == 0) {
+                                        s.absmax_local_warp[threadIdx.x / 32 - 4] = absmax;
+                                    }
 
-                            // TODO: Elementwise processing here, e.g. GELU
-                            // this will require an additional BF16 input in cases like GELU backwards
-                            // and smart prefetching from memory with limited available register/smem/l2 space...
-                            data_bf16_col[0][k] = (floatP)max(0.0f, d0);
-                            data_bf16_col[1][k] = (floatP)max(0.0f, d1);
-                            */
-                        }
-
-                        if constexpr (ENABLE_ABSMAX_SCALING) {
-                            if (i == 7) {
-                                floatP* absmax_bf16_ptr = (floatP*)&absmax_bf16_vec2;
-                                float absmax = max(fabsf((float)absmax_bf16_ptr[0]), fabsf((float)absmax_bf16_ptr[1]));
-                                asm volatile("redux.sync.max.u32 %0, %1, 0xff;" : "=r"(*((uint*)&absmax)) : "r"(*((uint*)&absmax)));
-
-                                uint32_t laneid;
-                                asm volatile("mov.u32 %0, %laneid;\n" : "=r"(laneid) :);
-                                if (laneid == 0) {
-                                    s.absmax_local_warp[threadIdx.x / 32 - 4] = absmax;
-                                }
-
-                                asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
-                                if (tid < CLUSTERS) {
-                                    absmax = max(absmax, s.absmax_local_warp[1 + 4 * wg_idx]);
-                                    absmax = max(absmax, s.absmax_local_warp[2 + 4 * wg_idx]);
-                                    absmax = max(absmax, s.absmax_local_warp[3 + 4 * wg_idx]);
-                                    uint32_t ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&s.absmax_cluster_warpgroup[wg_idx + cluster_rank * num_consumers]));
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b32 remAddr32;\n\t"
-                                        "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
-                                        "st.shared::cluster.f32 [remAddr32], %2;\n"
-                                        "}\n" :: "r"(ptr), "r"(tid), "f"(absmax));
-                                    arrive_cluster(absmax_barrier_start, tid);
+                                    asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
+                                    if (tid < CLUSTERS) {
+                                        absmax = max(absmax, s.absmax_local_warp[1 + 4 * wg_idx]);
+                                        absmax = max(absmax, s.absmax_local_warp[2 + 4 * wg_idx]);
+                                        absmax = max(absmax, s.absmax_local_warp[3 + 4 * wg_idx]);
+                                        uint32_t ptr = static_cast<uint32_t>(__cvta_generic_to_shared(&s.absmax_cluster_warpgroup[wg_idx + cluster_rank * num_consumers]));
+                                        asm volatile(
+                                            "{\n\t"
+                                            ".reg .b32 remAddr32;\n\t"
+                                            "mapa.shared::cluster.u32  remAddr32, %0, %1;\n\t"
+                                            "st.shared::cluster.f32 [remAddr32], %2;\n"
+                                            "}\n" :: "r"(ptr), "r"(tid), "f"(absmax));
+                                        arrive_cluster(absmax_barrier_start, tid);
+                                    }
                                 }
                             }
                         }
@@ -694,54 +707,54 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
 
             if (wg_idx == 0) {
-                #pragma unroll 4
+                #pragma unroll 1
                 for (int block_k_iter = unrolled_iterations, x = 0; block_k_iter < num_blocks_k; block_k_iter++, x++) {
                     warpgroup_wait<0>();
-                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((block_k_iter+3) & 3)), tid);
+                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((block_k_iter+(QSIZE-1)) & (QSIZE-1))), tid);
                     asm volatile("barrier.sync 5, 160;\n" ::: "memory");
 
                     if ((x & 3) == 0) {
                         for(int n_tile = 0; n_tile < 16; n_tile++) {
                             for (int k = 0; k < 8; k++) {
-                                d[n_tile][k] *= 1.000001f;
+                                //d[n_tile][k] *= 1.000001f;
                             }
                         }
                     }
 
                     warpgroup_arrive();
-                    for (int k_it = 0; k_it < 64/WGMMA_K; k_it++) {
-                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d, desc128 | (k_it * desc_multiplier));
+                    for (int k_it = 0; k_it < BK/WGMMA_K; k_it++) {
+                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d, desc128 | ((k_it % 4) * desc_multiplier) | ((k_it / 4) * desc_large_multiplier));
                     }
                     warpgroup_commit_batch();
 
-                    desc_id = (desc_id + 1) & 3;
+                    desc_id = (desc_id + 1) & (QSIZE-1);
                     desc128 = descAB[desc_id];
                 }
             } else {
-                #pragma unroll 4
+                #pragma unroll 1
                 for (int block_k_iter = unrolled_iterations, x = 0; block_k_iter < num_blocks_k; block_k_iter++, x++) {
                     warpgroup_wait<0>();
-                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((block_k_iter+3) & 3)), tid);
+                    if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((block_k_iter+(QSIZE-1)) & (QSIZE-1))), tid);
                     asm volatile("barrier.sync 6, 160;\n" ::: "memory");
 
                     if ((x & 3) == 0) {
                         for(int n_tile = 0; n_tile < 16; n_tile++) {
                             for (int k = 0; k < 8; k++) {
-                                d[n_tile][k] *= 1.000001f;
+                                //d[n_tile][k] *= 1.000001f;
                             }
                         }
                     }
 
                     warpgroup_arrive();
-                    for (int k_it = 0; k_it < 64/WGMMA_K; k_it++) {
-                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d, desc128 | (k_it * desc_multiplier));
+                    for (int k_it = 0; k_it < BK/WGMMA_K; k_it++) {
+                        wgmma<WGMMA_N, 1, 1, 1, 0, 0>(d, desc128 | ((k_it % 4) * desc_multiplier) | ((k_it / 4) * desc_large_multiplier));
                     }
                     warpgroup_commit_batch();
 
-                    desc_id = (desc_id + 1) & 3;
-                    desc128 = descAB[desc_id + 4];
+                    desc_id = (desc_id + 1) & (QSIZE-1);
+                    desc128 = descAB[desc_id + QSIZE];
                 }
-                desc_id += 4;
+                desc_id += QSIZE;
             }
 
 
@@ -754,7 +767,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
 
             warpgroup_wait<0>();
-            if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(3), tid);
+            if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR((QSIZE-1)), tid);
             //asm volatile("barrier.arrive 14, 288;\n" ::);
 
             for(int n_tile = 0; n_tile < 16; n_tile++) {
@@ -789,15 +802,17 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                         asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
                     }
 
-                    int4 out0_data = ((int4*)d_x16)[i*2], out1_data = ((int4*)d_x16)[i*2+1];
-                    if (tid & 32) {
-                        out0_data = make_int4(out0_data.z, out0_data.w, out0_data.x, out0_data.y);
-                        out1_data = make_int4(out1_data.z, out1_data.w, out1_data.x, out1_data.y);
-                    }
-
                     int idx_32b = idx_32b_base + (y_base / 16) * 4 * 128;
                     idx_32b += (i%4) * 2*WGMMA_M*BN / (8*2);
-                    idx_32b ^= (idx_32b & 128) ? 2 : 0;
+
+                    int4 out0_data = ((int4*)d_x16)[i*2], out1_data = ((int4*)d_x16)[i*2+1];
+                    if constexpr (AVOID_SHARED_CONFLICTS) {
+                        if (tid & 32) {
+                            out0_data = make_int4(out0_data.z, out0_data.w, out0_data.x, out0_data.y);
+                            out1_data = make_int4(out1_data.z, out1_data.w, out1_data.x, out1_data.y);
+                        }
+                        idx_32b ^= (idx_32b & 128) ? 2 : 0;
+                    }
 
                     *out0[i%4] = out0_data, *out1[i%4] = out1_data;
                     asm volatile("bar.sync %0, 128;\n" :: "r"(wg_idx));
@@ -853,22 +868,21 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
 }
 
-void runKernel10(int M, int N, int K, floatX *A, floatX *B, floatX *C, floatP *I, unsigned int* zeroed_scalar_gpu) {
+void runKernel10(int M, int N, int K, floatX *A, floatX *B, floatP *C, floatP *I, unsigned int* zeroed_scalar_gpu) {
     constexpr int BM = 128;
     constexpr int BN = 256;
-    constexpr int BK = 64;
+    constexpr int BK = sizeof(floatX) == 1 ? 128 : 64;
     constexpr int NUM_THREADS = 128*3;
     constexpr int QSIZE = 4;
     constexpr int CLUSTER_M = 2;
     constexpr int NUM_SM = 114; // H100 PCIe :(
     static_assert(NUM_SM % (CLUSTER_M) == 0);
-    assert(K >= 8 * BK);
+    assert(K >= 8 * BK); // TODO: why was this???
 
     if (_prev_m != M || _prev_n != N || _prev_k != K) {
         d_tma_map_A = create_tensor_map<BM, BK>(A, M, K);
         d_tma_map_B = create_tensor_map<BN, BK>(B, N, K);
-        d_tma_map_C = create_tensor_map<BN, BM, false>(C, N, M);
-        d_tma_map_I = create_tensor_map<BN/8, BM, false>(I, N, M);
+        d_tma_map_I = create_tensor_map<BN/8, BM, false, floatP>(I, N, M);
         _prev_m = M, _prev_n = N, _prev_k = K;
 
         // TODO: make this slightly less hacky
@@ -907,7 +921,7 @@ void runKernel10(int M, int N, int K, floatX *A, floatX *B, floatX *C, floatP *I
     static_assert(sMemSize < 256 * 1024);
     cudaCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
 
-    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, C, I, d_tma_map_C, d_tma_map_I, d_tma_map_A, d_tma_map_B, zeroed_scalar_gpu);
+    kernel<<<NUM_SM, NUM_THREADS, sMemSize>>>(M, N, K, C, I, d_tma_map_I, d_tma_map_A, d_tma_map_B, zeroed_scalar_gpu);
     cudaCheck(cudaDeviceSynchronize());
 }
 

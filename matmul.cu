@@ -2,21 +2,37 @@
 #include <sys/time.h>
 #include <stdio.h>
 #include <cuda_bf16.h>
-//#include <cuda_fp8.h>
 #include <assert.h>
 
+#define FP8
+
+#ifdef FP8
+#include <cuda_fp8.h>
+typedef __nv_fp8_e4m3 floatX;
+#define WGMMA_INSTRUCTION "wgmma.mma_async.sync.aligned.m64n256k32.f32.e4m3.e4m3"
+constexpr auto CU_TENSOR_FLOATX = CU_TENSOR_MAP_DATA_TYPE_UINT8;
+#define MAX_DIFF_ABS 8.0f
+#define MAX_DIFF_REL 1.05f
+#else
 typedef __nv_bfloat16 floatX;
+#define WGMMA_INSTRUCTION "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16"
+constexpr auto CU_TENSOR_FLOATX = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+#define MAX_DIFF_ABS 0.01f
+#define MAX_DIFF_REL 1.001f
+#endif
+
 typedef __nv_bfloat16 floatP;
-#define CUBLAS_FLOATX CUDA_R_16BF
+#define CUBLAS_FLOATP CUDA_R_16BF
+constexpr auto CU_TENSOR_FLOATP = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
 
 constexpr bool ENABLE_C_INPUT = false;
 constexpr float ENABLE_ABSMAX_SCALING = 0.0f;
+constexpr bool AVOID_SHARED_CONFLICTS = false;
 
 #define ENABLE_CUBLAS
 #define ENABLE_RANDOM
 #define ENABLE_TRUE_RANDOM
 #define SLEEP_BETWEEN_KERNELS_SEC 1 // optional rest to avoid thermal throttling between kernels
-#define REFERENCE_KERNEL 0
 constexpr bool RUN_VERIF = true;
 constexpr int max_size = 16384;
 constexpr int prime = 3719;
@@ -54,11 +70,11 @@ std::default_random_engine generator(69);
 #ifdef ENABLE_CUBLAS
 #include <cublas_v2.h>
 cublasHandle_t cublas_handle;
-void runCublasGemmBF16(int M, int N, int K, floatX *A, floatX *B, floatX *C) {
+void runCublasGemmBF16(int M, int N, int K, floatP *A, floatP *B, floatP *C) {
   float alpha = 1, beta = 0;
   // C(column major) = A(row major) * B(column major)
-  cublasStatus_t status = cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A, CUBLAS_FLOATX,
-    N, B, CUBLAS_FLOATX, K, &beta, C, CUBLAS_FLOATX, N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
+  cublasStatus_t status = cublasGemmEx(cublas_handle, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, A, CUBLAS_FLOATP,
+    K, B, CUBLAS_FLOATP, K, &beta, C, CUBLAS_FLOATP, M, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT);
 
   if (status != CUBLAS_STATUS_SUCCESS) {
     printf("CUBLAS error: %d\n", status);
@@ -67,11 +83,11 @@ void runCublasGemmBF16(int M, int N, int K, floatX *A, floatX *B, floatX *C) {
 }
 #endif
 
-void run_kernel(int kernel_num, int M, int N, int K, floatX *A, floatX *B, floatX *C, floatX *I, unsigned int* scalar_gpu) {
+void run_kernel(int kernel_num, int M, int N, int K, floatX *A, floatX *B, floatP *C, floatP *I, unsigned int* scalar_gpu) {
   switch (kernel_num) {
     case 0:
 #ifdef ENABLE_CUBLAS
-      runCublasGemmBF16(M, N, K, A, B, C);
+      runCublasGemmBF16(M, N, K, (floatP*)A, (floatP*)B, C);
 #endif
       break;
     case 10:
@@ -80,10 +96,10 @@ void run_kernel(int kernel_num, int M, int N, int K, floatX *A, floatX *B, float
   }
 }
 
-void randomize_matrix(floatX *mat, int N, float scale=1.0f) {
+void randomize_matrix(floatP *mat, int N, float scale=1.0f) {
   if (scale == 0.0f) {
     for (int i = 0; i < N; i++) {
-      mat[i] = (floatX)(i*1000);
+      mat[i] = (floatP)(i*1000);
     }
     return;
   }
@@ -91,30 +107,30 @@ void randomize_matrix(floatX *mat, int N, float scale=1.0f) {
   std::normal_distribution<float> distribution(0, scale);
 #ifdef ENABLE_TRUE_RANDOM
   for (int i = 0; i < N; i++) {
-    mat[i] = (floatX)(distribution(generator) + 0.01f)  ;
+    mat[i] = (floatP)((floatX)(distribution(generator) + 0.01f));
   }
 #else
   int i = 0;
   for (; i < prime; i++) {
-    mat[i] = distribution(generator);
+    mat[i] = (floatP)((floatX)distribution(generator));
   }
   for (int multiplier = 1; i < N-(prime * multiplier); i += prime * multiplier, multiplier *= 2) {
-    memcpy(mat+i, mat, sizeof(floatX) * prime);
+    memcpy(mat+i, mat, sizeof(floatP) * prime);
   }
   for (; i < N-prime; i += prime) {
-    memcpy(mat+i, mat, sizeof(floatX) * prime);
+    memcpy(mat+i, mat, sizeof(floatP) * prime);
   }
   for (; i < N; i++) {
     mat[i] = mat[i-prime];
   }
 #endif
 #else
-  cudaMemset(mat, 0, sizeof(floatX) * N);
+  cudaMemset(mat, 0, sizeof(floatP) * N);
 #endif
 }
 
 /*
-bool verify_matrix(floatX *matRef, floatX *matOut, int N) {
+bool verify_matrix(floatP *matRef, floatP *matOut, int N) {
   double diff = 0.0;
   int i;
   for (i = 0; i < N; i++) {
@@ -131,7 +147,7 @@ bool verify_matrix(floatX *matRef, floatX *matOut, int N) {
 }
 */
 
-__global__ void verify_matrix_kernel(floatX *matRef, floatX *matOut, floatX *matI, unsigned int *error, size_t N) {
+__global__ void verify_matrix_kernel(floatP *matRef, floatP *matOut, floatP *matI, unsigned int *error, size_t N) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
 
 /*
@@ -150,7 +166,7 @@ __global__ void verify_matrix_kernel(floatX *matRef, floatX *matOut, floatX *mat
 */
 
   if (i < N) {
-    float ref_with_added = (float)((floatX)(((float)matRef[i] + (float)(ENABLE_C_INPUT ? (float)matI[i] : 0.0f))));
+    float ref_with_added = (float)((floatP)(((float)matRef[i] + (float)(ENABLE_C_INPUT ? (float)matI[i] : 0.0f))));
     float diff = fabs(ref_with_added - (float)matOut[i]);
 
     int x_base = i % max_size;
@@ -168,58 +184,79 @@ __global__ void verify_matrix_kernel(floatX *matRef, floatX *matOut, floatX *mat
           for (int x = 0; x < 256; x++) {
             for (int y = 0; y < 256; y++) {
               int idx = (x + x_base) + (y + y_base) * max_size;
-              float ref_with_added = (float)((floatX)(((float)matRef[idx] + (float)(ENABLE_C_INPUT ? (float)matI[idx] : 0.0f))));
+              float ref_with_added = (float)((floatP)(((float)matRef[idx] + (float)(ENABLE_C_INPUT ? (float)matI[idx] : 0.0f))));
               absmax = max(absmax, fabsf(ref_with_added));
             }
           }
-          floatX absmax_bf16 = (floatX)absmax;
+          floatP absmax_bf16 = (floatP)absmax;
           diff = fabsf((float)absmax_bf16 - (float)matOut[i]);
           if (diff > 2.0) {
             printf("absmax: %5.20f vs claimed_absmax: %5.20f (at: %d/%d)\n", (float)absmax_bf16, (float)matOut[i], (int)x_base, (int)y_base);
             *error = 1;
           }
         } else {
-          if (diff > 100.0f && ((float)ref_with_added / (float)matOut[i] > 1.01f || (float)ref_with_added / (float)matOut[i] < 0.99f)) {
+          if (diff > MAX_DIFF_ABS && ((float)ref_with_added / (float)matOut[i] > MAX_DIFF_REL || (float)ref_with_added / (float)matOut[i] < (1.0f/MAX_DIFF_REL))) {
             printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d\n", ref_with_added, (float)matOut[i], diff, i);
             *error = 1;
           }
         }
       }
+    } else {
+      //printf("OK! Should %5.20f, Is %5.20f (Diff %5.7f) at %d\n", ref_with_added, (float)matOut[i], diff, i);
     }
+  }
+}
+
+__global__ void copy_to_floatX(floatP *input, floatX *output, size_t N) {
+  size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (i < N) {
+    output[i] = (floatX)input[i];
   }
 }
 
 int main() {
   get_time();
-  long m = max_size, n = max_size, k = max_size;
+  long m = max_size, n = max_size, k = max_size; // TODO: doesn't work if not all the same yet, need to debug
 
-  floatX *A = nullptr, *B = nullptr, *C = nullptr, *I = nullptr, *C_ref = nullptr;  // host matrices
-  floatX *dA = nullptr, *dB = nullptr, *dC = nullptr, *dI = nullptr, *dC_ref = nullptr; // device matrices
+  floatP *A = nullptr, *B = nullptr, *C = nullptr, *I = nullptr, *C_ref = nullptr;  // host matrices
+  floatP *dA = nullptr, *dB = nullptr, *dC = nullptr, *dI = nullptr, *dC_ref = nullptr; // device matrices
+  floatX *dA_X = nullptr,*dB_X= nullptr, *dC_X = nullptr, *dI_X;
 
-  A = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
-  B = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
-  C = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
-  I = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
-  C_ref = (floatX *)malloc(sizeof(floatX) * max_size * max_size);
+  A = (floatP *)malloc(sizeof(floatP) * m * k);
+  B = (floatP *)malloc(sizeof(floatP) * n * k);
+  C = (floatP *)malloc(sizeof(floatP) * m * n);
+  I = (floatP *)malloc(sizeof(floatP) * m * n);
+  C_ref = (floatP *)malloc(sizeof(floatP) * m * n);
 
-  randomize_matrix(A, max_size * max_size);
-  randomize_matrix(B, max_size * max_size);
-  randomize_matrix(I, max_size * max_size, 0.0f);
+  randomize_matrix(A, m * k);
+  randomize_matrix(B, n * k);
+  randomize_matrix(I, m * n, 0.0f);
 
   unsigned int* scalar_gpu;
   unsigned int scalar_host;
   cudaMalloc((void**)&scalar_gpu, sizeof(unsigned int));
   cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
-  cudaCheck(cudaMalloc((void **)&dA, sizeof(floatX) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dB, sizeof(floatX) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dC, sizeof(floatX) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dI, sizeof(floatX) * max_size * max_size));
-  cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(floatX) * max_size * max_size));
+  cudaCheck(cudaMalloc((void **)&dA, sizeof(floatP) * m * k));
+  cudaCheck(cudaMalloc((void **)&dB, sizeof(floatP) * n * k));
+  cudaCheck(cudaMalloc((void **)&dC, sizeof(floatP) * m * n));
+  cudaCheck(cudaMalloc((void **)&dI, sizeof(floatP) * m * n));
+  cudaCheck(cudaMalloc((void **)&dC_ref, sizeof(floatP) * m * n));
 
-  cudaCheck(cudaMemcpyAsync(dA, A, sizeof(floatX) * max_size * max_size, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpyAsync(dB, B, sizeof(floatX) * max_size * max_size, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpyAsync(dC, I, sizeof(floatX) * max_size * max_size, cudaMemcpyHostToDevice));
-  cudaCheck(cudaMemcpyAsync(dI, I, sizeof(floatX) * max_size * max_size, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMalloc((void **)&dA_X, sizeof(floatX) * m * k));
+  cudaCheck(cudaMalloc((void **)&dB_X, sizeof(floatX) * n * k));
+  cudaCheck(cudaMalloc((void **)&dC_X, sizeof(floatX) * m * n));
+  cudaCheck(cudaMalloc((void **)&dI_X, sizeof(floatX) * m * n));
+
+  cudaCheck(cudaMemcpyAsync(dA, A, sizeof(floatP) * m * k, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dB, B, sizeof(floatP) * n * k, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dC, I, sizeof(floatP) * m * n, cudaMemcpyHostToDevice));
+  cudaCheck(cudaMemcpyAsync(dI, I, sizeof(floatP) * m * n, cudaMemcpyHostToDevice));
+
+  copy_to_floatX<<<CEIL_DIV(m * k, 1024), 1024>>>(dA, dA_X, m * k);
+  copy_to_floatX<<<CEIL_DIV(n * k, 1024), 1024>>>(dB, dB_X, n * k);
+  copy_to_floatX<<<CEIL_DIV(m * n, 1024), 1024>>>(dC, dC_X, m * n);
+  copy_to_floatX<<<CEIL_DIV(m * n, 1024), 1024>>>(dI, dI_X, m * n);
 
 #ifdef ENABLE_CUBLAS
   cublasCreate(&cublas_handle);
@@ -244,27 +281,29 @@ int main() {
     }
     first_run = false;
 
+#ifdef ENABLE_CUBLAS
     // Verify against cuBLAS. Also serves as a warmup step
     if (run_verif) {
-      cudaCheck(cudaMemset(dC, 0, sizeof(floatX) * max_size * max_size));
-      cudaCheck(cudaMemset(dC_ref, 0, sizeof(floatX) * max_size * max_size));
+      cudaCheck(cudaMemset(dC, 0, sizeof(floatP) * m * n));
+      cudaCheck(cudaMemset(dC_ref, 0, sizeof(floatP) * m * n));
       cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
 
-      run_kernel(kernel_num, m, n, k, dA, dB, dC, dI, scalar_gpu);
-      run_kernel(REFERENCE_KERNEL, m, n, k, dA, dB, dC_ref, dI, scalar_gpu);
+      run_kernel(kernel_num, m, n, k, dA_X, dB_X, dC, dI, scalar_gpu);
+      runCublasGemmBF16(m, n, k, dA, dB, dC_ref);
 
       cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
       verify_matrix_kernel<<<CEIL_DIV(m * n, 1024), 1024>>>(dC_ref, dC, dI, scalar_gpu, m * n);
       cudaMemcpy(&scalar_host, scalar_gpu, sizeof(unsigned int), cudaMemcpyDeviceToHost); // can only be async because next memcpy isn't
       printf("\n=======> Kernel %d -> VERIFICATION: %s\n\n", kernel_num, scalar_host ? "!!!!! FAILED !!!!!" : "OK");
     }
+#endif
 
     printf("Benchmarking kernel %d - time: %d\n", kernel_num, get_time());
 
     // Benchmark
     cudaEventRecord(start);
     for (int j = 0; j < repeat_times; j++) {
-      run_kernel(kernel_num, m, n, k, dA, dB, dC, dI, scalar_gpu);
+      run_kernel(kernel_num, m, n, k, dA_X, dB_X, dC, dI, scalar_gpu);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(start);
@@ -287,6 +326,10 @@ int main() {
   cudaFree(dB);
   cudaFree(dC);
   cudaFree(dC_ref);
+  cudaFree(dA_X);
+  cudaFree(dB_X);
+  cudaFree(dC_X);
+  cudaFree(dI_X);
   cudaFree(scalar_gpu);
   return 0;
 };
