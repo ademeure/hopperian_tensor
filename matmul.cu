@@ -6,6 +6,7 @@
 #include <assert.h>
 
 typedef __nv_bfloat16 floatX;
+typedef __nv_bfloat16 floatP;
 #define CUBLAS_FLOATX CUDA_R_16BF
 
 constexpr bool ENABLE_C_INPUT = false;
@@ -19,7 +20,7 @@ constexpr float ENABLE_ABSMAX_SCALING = 0.0f;
 constexpr bool RUN_VERIF = true;
 constexpr int max_size = 16384;
 constexpr int prime = 3719;
-int repeat_times = 10;
+int repeat_times = 128;
 
 int get_time() {
   static int last_time = 0;
@@ -149,7 +150,7 @@ __global__ void verify_matrix_kernel(floatX *matRef, floatX *matOut, floatX *mat
 */
 
   if (i < N) {
-    float ref_with_added = (float)((floatX)(((float)matRef[i] + (float)0)));
+    float ref_with_added = (float)((floatX)(((float)matRef[i] + (float)(ENABLE_C_INPUT ? (float)matI[i] : 0.0f))));
     float diff = fabs(ref_with_added - (float)matOut[i]);
 
     int x_base = i % max_size;
@@ -167,7 +168,7 @@ __global__ void verify_matrix_kernel(floatX *matRef, floatX *matOut, floatX *mat
           for (int x = 0; x < 256; x++) {
             for (int y = 0; y < 256; y++) {
               int idx = (x + x_base) + (y + y_base) * max_size;
-              float ref_with_added = (float)((floatX)(((float)matRef[idx] + (float)0)));
+              float ref_with_added = (float)((floatX)(((float)matRef[idx] + (float)(ENABLE_C_INPUT ? (float)matI[idx] : 0.0f))));
               absmax = max(absmax, fabsf(ref_with_added));
             }
           }

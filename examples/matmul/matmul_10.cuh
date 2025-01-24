@@ -1,10 +1,7 @@
 //constexpr bool ENABLE_C_INPUT = false;
 //constexpr float ENABLE_ABSMAX_SCALING = 1.0f;
 
-//#define CU_TENSOR_FLOATX CU_TENSOR_MAP_DATA_TYPE_FLOAT16
-//#define WGMMA_INSTRUCTION "wgmma.mma_async.sync.aligned.m64n256k16.f16.f16.f16 "
-//#define FP16_ACCUMULATION
-
+#define WGMMA_INSTRUCTION "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16"
 #define CU_TENSOR_FLOATX CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
 
 namespace M10 {
@@ -29,7 +26,7 @@ __device__ void warpgroup_wait() {
 }
 
 template <int BlockMajorSize, int BlockMinorSize, bool swizzle=true>
-__host__ static inline CUtensorMap create_tensor_map(floatX* gmem_ptr, int global_height, int global_width) {
+__host__ static inline CUtensorMap create_tensor_map(void* gmem_ptr, int global_height, int global_width) {
     CUtensorMap tma_map;
     void* gmem_address = (void*)gmem_ptr;
     static_assert(BlockMinorSize >= 64);
@@ -49,53 +46,13 @@ __host__ static inline CUtensorMap create_tensor_map(floatX* gmem_ptr, int globa
 }
 
 template<int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-#ifdef FP16_ACCUMULATION
-__device__ __forceinline__ void wgmma256(int d[16][4], uint64_t desc_a, uint64_t desc_b) {
-    // On H100, this takes 128 cycles: 256N * 64M * 16K * 2 flops = 512K
-    // 4096 BF16 flops per SM per clock ==> 512K / 4096 = 128 cycles
-    // So doing 4 of those with BK=64 takes 512 cycles
-    asm volatile(
-        "{\n"
-        WGMMA_INSTRUCTION
-        "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
-        " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
-        " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
-        " %24,  %25,  %26,  %27,  %28,  %29,  %30,  %31,  "
-        " %32,  %33,  %34,  %35,  %36,  %37,  %38,  %39,  "
-        " %40,  %41,  %42,  %43,  %44,  %45,  %46,  %47,  "
-        " %48,  %49,  %50,  %51,  %52,  %53,  %54,  %55,  "
-        " %56,  %57,  %58,  %59,  %60,  %61,  %62,  %63},"
-        " %64,"
-        " %65,"
-        " %66,    %67,  %68,  %69,  %70;\n"
-        "}\n"
-        :   "+r"(d[0][0]), "+r"(d[0][1]), "+r"(d[0][2]), "+r"(d[0][3]),
-            "+r"(d[1][0]), "+r"(d[1][1]), "+r"(d[1][2]), "+r"(d[1][3]),
-            "+r"(d[2][0]), "+r"(d[2][1]), "+r"(d[2][2]), "+r"(d[2][3]),
-            "+r"(d[3][0]), "+r"(d[3][1]), "+r"(d[3][2]), "+r"(d[3][3]),
-            "+r"(d[4][0]), "+r"(d[4][1]), "+r"(d[4][2]), "+r"(d[4][3]),
-            "+r"(d[5][0]), "+r"(d[5][1]), "+r"(d[5][2]), "+r"(d[5][3]),
-            "+r"(d[6][0]), "+r"(d[6][1]), "+r"(d[6][2]), "+r"(d[6][3]),
-            "+r"(d[7][0]), "+r"(d[7][1]), "+r"(d[7][2]), "+r"(d[7][3]),
-            "+r"(d[8][0]), "+r"(d[8][1]), "+r"(d[8][2]), "+r"(d[8][3]),
-            "+r"(d[9][0]), "+r"(d[9][1]), "+r"(d[9][2]), "+r"(d[9][3]),
-            "+r"(d[10][0]), "+r"(d[10][1]), "+r"(d[10][2]), "+r"(d[10][3]),
-            "+r"(d[11][0]), "+r"(d[11][1]), "+r"(d[11][2]), "+r"(d[11][3]),
-            "+r"(d[12][0]), "+r"(d[12][1]), "+r"(d[12][2]), "+r"(d[12][3]),
-            "+r"(d[13][0]), "+r"(d[13][1]), "+r"(d[13][2]), "+r"(d[13][3]),
-            "+r"(d[14][0]), "+r"(d[14][1]), "+r"(d[14][2]), "+r"(d[14][3]),
-            "+r"(d[15][0]), "+r"(d[15][1]), "+r"(d[15][2]), "+r"(d[15][3])
-        : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
-            "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
-}
-#else
 __device__ __forceinline__ void wgmma256(float d[16][8], uint64_t desc_a, uint64_t desc_b) {
     // On H100, this takes 128 cycles: 256N * 64M * 16K * 2 flops = 512K
     // 4096 BF16 flops per SM per clock ==> 512K / 4096 = 128 cycles
     // So doing 4 of those with BK=64 takes 512 cycles
     asm volatile(
         "{\n"
-        "wgmma.mma_async.sync.aligned.m64n256k16.f32.bf16.bf16 "
+        WGMMA_INSTRUCTION
         "{%0,   %1,   %2,   %3,   %4,   %5,   %6,   %7,   "
         " %8,   %9,   %10,  %11,  %12,  %13,  %14,  %15,  "
         " %16,  %17,  %18,  %19,  %20,  %21,  %22,  %23,  "
@@ -135,14 +92,9 @@ __device__ __forceinline__ void wgmma256(float d[16][8], uint64_t desc_a, uint64
         : "l"(desc_a), "l"(desc_b), "n"(int32_t(ScaleD)), "n"(int32_t(ScaleA)),
             "n"(int32_t(ScaleB)), "n"(int32_t(TransA)), "n"(int32_t(TransB)));
 }
-#endif
 
 template<int WGMMA_N, int ScaleD, int ScaleA, int ScaleB, int TransA, int TransB>
-#ifdef FP16_ACCUMULATION
-__device__ __forceinline__ void wgmma(int d[WGMMA_N/16][4], __int128 desc128) {
-#else
 __device__ __forceinline__ void wgmma(float d[WGMMA_N/16][8], __int128 desc128) {
-#endif
     uint64_t desc_a = ((uint64_t*)&desc128)[0]; // N.B.: ULDC is up to 64-bit reads, so HW won't coalesce into 128-bit
     uint64_t desc_b = ((uint64_t*)&desc128)[1];
 
@@ -272,7 +224,7 @@ template <int BM, int BN, int BK, int QSIZE>
 struct SMem {
     alignas(1024) floatX A[BM*BK*QSIZE];
     alignas(1024) floatX B[BK*BN*QSIZE];
-    alignas(1024) floatX C[BN*BM/2];
+    alignas(1024) floatP C[BN*BM/2];
     // mbarriers
     alignas(8) uint64_t full[QSIZE], empty[QSIZE];
     alignas(8) uint64_t absmax_barrier;
@@ -284,12 +236,12 @@ struct SMem {
 
 #define FULL_PTR(i) (full_start + i*8)
 #define EMPTY_PTR(i) (empty_start + i*8)
-#define SA_PTR(i) (sA_start + i*BK*BM*2)
-#define SB_PTR(i) (sB_start + i*BK*BN*2)
-#define SC_PTR(i) (sC_start + (i*BM*BN*2)/8)
+#define SA_PTR(i) (sA_start + i*BK*BM*sizeof(floatX))
+#define SB_PTR(i) (sB_start + i*BK*BN*sizeof(floatX))
+#define SC_PTR(i) (sC_start + (i*BM*BN*sizeof(floatP))/8)
 
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int NUM_SM, int CLUSTERS, bool RELU=false, bool SQUARED=false>
-__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, floatX* C, floatX* D, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapI, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counter) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, floatP* C, floatX* D, const __grid_constant__ CUtensorMap tensorMapC, const __grid_constant__ CUtensorMap tensorMapI, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counter) {
     constexpr int MULTIPLE_EVERY_DIMENSON = 256;
     constexpr int MINIMUM_K_ITERATIONS = MULTIPLE_EVERY_DIMENSON / BK;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1; // == 2
@@ -297,7 +249,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
     extern __shared__ __align__(128) uint8_t smem[];
     SMem<BM, BN, BK, QSIZE> &s = *reinterpret_cast<SMem<BM, BN, BK, QSIZE>*>(smem);
-    floatX *sA = s.A, *sB = s.B, *sC = s.C;
+    floatX *sA = s.A, *sB = s.B;
+    floatP *sC = s.C;
     uint64_t *full = s.full, *empty = s.empty, *absmax_barrier = &s.absmax_barrier;
 
     if (threadIdx.x == 0) {
@@ -392,6 +345,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     if constexpr (ENABLE_C_INPUT) {
                         if (!first) {
                             for (; block_k_iter < 8; block_k_iter++) {
+                                wait(EMPTY_PTR(qidx), p);
                                 expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(floatX));
                                 load_async_multicast(SB_PTR(qidx), &tensorMapB, FULL_PTR(qidx), block_k_iter*BK, block_n*BN, multicast_mask);
                                 load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
@@ -399,7 +353,6 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
                                 if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
                                 //__nanosleep(128);
-                                wait(EMPTY_PTR(qidx), p);
                             }
                         }
                     }
@@ -427,13 +380,13 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     if constexpr (ENABLE_C_INPUT) {
                         if (!first) {
                             for (; block_k_iter < 8; block_k_iter++) {
+                                wait(EMPTY_PTR(qidx), p);
                                 expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM + BM*BN/8)*sizeof(floatX));
                                 load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
                                 load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + block_k_iter*BN/8);
 
                                 if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
                                 //__nanosleep(128);
-                                wait(EMPTY_PTR(qidx), p);
                             }
                         }
                     }
@@ -459,10 +412,10 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 if (!first) {
                     // TODO: all of A/B for that qidx is free by this point; so we could theoretically do it in a single step
                     for (int i = 0; i < 8; i++) {
+                        wait(EMPTY_PTR(qidx), p);
                         expect_bytes(FULL_PTR(qidx), (BM*BN/8)*sizeof(floatX));
                         load_async(SC_PTR(qidx), &tensorMapI, FULL_PTR(qidx), previous_m*BM, previous_n*BN + i*BN/8);
                         if (++qidx == QSIZE) { qidx = 0; p ^= 1; }
-                        wait(EMPTY_PTR(qidx), p);
                     }
                 }
             }
@@ -489,6 +442,32 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
             }
         } else if (threadIdx.x == 96) {
+/*
+            asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
+            ushort4 tileinfo = s.tileinfo[0];
+            block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
+
+            while (schedule_next) {
+                #pragma unroll 1
+                for (int block_k_iter = 0; block_k_iter < num_blocks_k;) {
+                    if constexpr (MINIMUM_K_ITERATIONS % QSIZE == 0) {
+                        qidx = 0;
+                    }
+                    #pragma unroll MINIMUM_K_ITERATIONS
+                    for (int j = 0; j < MINIMUM_K_ITERATIONS; j++, block_k_iter++) {
+                        wait(FULL_PTR(qidx), p);
+                        asm volatile("barrier.sync 5, 160;\n" ::);
+                        //asm volatile("barrier.sync 6, 160;\n" ::);
+                        if (++qidx == QSIZE) { qidx = 0; p ^= 1;}
+                    }
+                }
+                ushort4 tileinfo = s.tileinfo[++tileinfo_idx % 4];
+                block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
+            }
+*/
+
+
+
             /*
             asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
             ushort4 tileinfo = s.tileinfo[0];
@@ -521,9 +500,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 #else
         float d[WGMMA_N/16][8];
 #endif
-        floatX d_x16[WGMMA_N/16][8];
+        floatP d_x16[WGMMA_N/16][8];
 
-        floatX* block_sC = sC + wg_idx*64*32; //wg_idx*WGMMA_M*BN/2;
+        floatP* block_sC = sC + wg_idx*64*32; //wg_idx*WGMMA_M*BN/2;
         int4* block_sC_128b = (int4*)block_sC;
         int* block_sC_32b = (int*)block_sC;
         int4 *block_C_thread;
@@ -615,24 +594,18 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                                 asm volatile("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(data) : "r"(data), "r"(data), "r"(0));
                             }
 
-                            d_x16[i*2+0][k] = ((floatX*)&data)[0];
-                            d_x16[i*2+1][k] = ((floatX*)&data)[1];
+                            d_x16[i*2+0][k] = ((floatP*)&data)[0];
+                            d_x16[i*2+1][k] = ((floatP*)&data)[1];
 
                             if constexpr (ENABLE_C_INPUT) {
-                                d_x16[i*2+0][k] = (floatX)((float)d_x16[i*2+0][k] + (float)((floatX*)&input0)[k]);
-                                d_x16[i*2+1][k] = (floatX)((float)d_x16[i*2+1][k] + (float)((floatX*)&input1)[k]);
+                                d_x16[i*2+0][k] = (floatP)((float)d_x16[i*2+0][k] + (float)((floatX*)&input0)[k]);
+                                d_x16[i*2+1][k] = (floatP)((float)d_x16[i*2+1][k] + (float)((floatX*)&input1)[k]);
                             }
 
                             if constexpr (ENABLE_ABSMAX_SCALING) {
                                 if (k % 2) {
-                                    // TODO: should this depend on something else than this?
-                                    if constexpr (std::is_same<floatX,half>::value) {
-                                        asm volatile("max.xorsign.abs.f16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+0][k-1])));
-                                        asm volatile("max.xorsign.abs.f16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+1][k-1])));
-                                    } else {
-                                        asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+0][k-1])));
-                                        asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+1][k-1])));
-                                    }
+                                    asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+0][k-1])));
+                                    asm volatile("max.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(absmax_bf16_vec2) : "r"(absmax_bf16_vec2), "r"(*((int*)&d_x16[i*2+1][k-1])));
                                 }
                             }
 
@@ -645,14 +618,14 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                             // TODO: Elementwise processing here, e.g. GELU
                             // this will require an additional BF16 input in cases like GELU backwards
                             // and smart prefetching from memory with limited available register/smem/l2 space...
-                            data_bf16_col[0][k] = (floatX)max(0.0f, d0);
-                            data_bf16_col[1][k] = (floatX)max(0.0f, d1);
+                            data_bf16_col[0][k] = (floatP)max(0.0f, d0);
+                            data_bf16_col[1][k] = (floatP)max(0.0f, d1);
                             */
                         }
 
                         if constexpr (ENABLE_ABSMAX_SCALING) {
                             if (i == 7) {
-                                floatX* absmax_bf16_ptr = (floatX*)&absmax_bf16_vec2;
+                                floatP* absmax_bf16_ptr = (floatP*)&absmax_bf16_vec2;
                                 float absmax = max(fabsf((float)absmax_bf16_ptr[0]), fabsf((float)absmax_bf16_ptr[1]));
                                 asm volatile("redux.sync.max.u32 %0, %1, 0xff;" : "=r"(*((uint*)&absmax)) : "r"(*((uint*)&absmax)));
 
@@ -693,7 +666,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
                                 // TODO: hack so we can test this, need to interleave it with other bits etc...
                                 if (tid == 0 && wg_idx == 0 && cluster_rank == 0) {
-                                    d_x16[0][0] = (floatX)final_absmax;
+                                    d_x16[0][0] = (floatP)final_absmax;
                                     //printf("(X: %d / Y: %d) absmax: %5.20f\n", previous_block_m * 128, previous_block_n * 256, (float)final_absmax);
                                 }
                             }
@@ -721,15 +694,17 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
 
 
             if (wg_idx == 0) {
-                #pragma unroll 1
-                for (int block_k_iter = unrolled_iterations; block_k_iter < num_blocks_k; block_k_iter++) {
+                #pragma unroll 4
+                for (int block_k_iter = unrolled_iterations, x = 0; block_k_iter < num_blocks_k; block_k_iter++, x++) {
                     warpgroup_wait<0>();
                     if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((block_k_iter+3) & 3)), tid);
                     asm volatile("barrier.sync 5, 160;\n" ::: "memory");
 
-                    for(int n_tile = 0; n_tile < 16; n_tile++) {
-                        for (int k = 0; k < 8; k++) {
-                            d[n_tile][k] *= 1.0001f;
+                    if ((x & 3) == 0) {
+                        for(int n_tile = 0; n_tile < 16; n_tile++) {
+                            for (int k = 0; k < 8; k++) {
+                                d[n_tile][k] *= 1.000001f;
+                            }
                         }
                     }
 
@@ -743,15 +718,17 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     desc128 = descAB[desc_id];
                 }
             } else {
-                #pragma unroll 1
-                for (int block_k_iter = unrolled_iterations; block_k_iter < num_blocks_k; block_k_iter++) {
+                #pragma unroll 4
+                for (int block_k_iter = unrolled_iterations, x = 0; block_k_iter < num_blocks_k; block_k_iter++, x++) {
                     warpgroup_wait<0>();
                     if (tid < CLUSTERS) arrive_cluster(EMPTY_PTR(((block_k_iter+3) & 3)), tid);
                     asm volatile("barrier.sync 6, 160;\n" ::: "memory");
 
-                    for(int n_tile = 0; n_tile < 16; n_tile++) {
-                        for (int k = 0; k < 8; k++) {
-                            d[n_tile][k] *= 1.0001f;
+                    if ((x & 3) == 0) {
+                        for(int n_tile = 0; n_tile < 16; n_tile++) {
+                            for (int k = 0; k < 8; k++) {
+                                d[n_tile][k] *= 1.000001f;
+                            }
                         }
                     }
 
@@ -783,21 +760,12 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             for(int n_tile = 0; n_tile < 16; n_tile++) {
                 if constexpr (RELU) {
                     for (int k = 0; k < 8; k += 2) {
-                        if constexpr (std::is_same<floatX,half>::value) {
-                            asm volatile("cvt.rn.relu.f16x2.f32 %0, %1, %2;"  : "=r"(*(int*)(&d_x16[n_tile][k])) : "f"(d[n_tile][k+1]), "f"(d[n_tile][k]));
-                        } else {
-                            asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;" : "=r"(*(int*)(&d_x16[n_tile][k])) : "f"(d[n_tile][k+1]), "f"(d[n_tile][k]));
-                        }
+                        asm volatile("cvt.rn.relu.bf16x2.f32 %0, %1, %2;" : "=r"(*(int*)(&d_x16[n_tile][k])) : "f"(d[n_tile][k+1]), "f"(d[n_tile][k]));
                     }
                 } else {
                     for (int k = 0; k < 4; k++) {
-#ifdef FP16_ACCUMULATION
-                        d_x16[n_tile][k*2+0] = ((floatX*)&d[n_tile][k])[0];
-                        d_x16[n_tile][k*2+1] = ((floatX*)&d[n_tile][k])[1];
-#else
-                        d_x16[n_tile][k*2+0] = (floatX)d[n_tile][k*2+0];
-                        d_x16[n_tile][k*2+1] = (floatX)d[n_tile][k*2+1];
-#endif
+                        d_x16[n_tile][k*2+0] = (floatP)d[n_tile][k*2+0];
+                        d_x16[n_tile][k*2+1] = (floatP)d[n_tile][k*2+1];
                     }
                 }
             }
@@ -842,12 +810,12 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                             asm volatile("fma.rn.bf16x2 %0, %1, %1, %2;" : "=r"(data) : "r"(data), "r"(0));
                         }
 
-                        d_x16[i*2+0][k] = ((floatX*)&data)[0];
-                        d_x16[i*2+1][k] = ((floatX*)&data)[1];
+                        d_x16[i*2+0][k] = ((floatP*)&data)[0];
+                        d_x16[i*2+1][k] = ((floatP*)&data)[1];
 
                         if constexpr (ENABLE_C_INPUT) {
-                            d_x16[i*2+0][k] = (floatX)((float)d_x16[i*2+0][k] + (float)((floatX*)&input0)[k]);
-                            d_x16[i*2+1][k] = (floatX)((float)d_x16[i*2+1][k] + (float)((floatX*)&input1)[k]);
+                            d_x16[i*2+0][k] = (floatP)((float)d_x16[i*2+0][k] + (float)((floatX*)&input0)[k]);
+                            d_x16[i*2+1][k] = (floatP)((float)d_x16[i*2+1][k] + (float)((floatX*)&input1)[k]);
                         }
 
                         /*
@@ -859,8 +827,8 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                         // TODO: Elementwise processing here, e.g. GELU
                         // this will require an additional BF16 input in cases like GELU backwards
                         // and smart prefetching from memory with limited available register/smem/l2 space...
-                        d_x16[i*2+0][k] = (floatX)max(0.0f, d0);
-                        d_x16[i*2+1][k] = (floatX)max(0.0f, d1);
+                        d_x16[i*2+0][k] = (floatP)max(0.0f, d0);
+                        d_x16[i*2+1][k] = (floatP)max(0.0f, d1);
                         */
                     }
 
@@ -885,7 +853,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
 }
 
-void runKernel10(int M, int N, int K, floatX *A, floatX *B, floatX *C, floatX *I, unsigned int* zeroed_scalar_gpu) {
+void runKernel10(int M, int N, int K, floatX *A, floatX *B, floatX *C, floatP *I, unsigned int* zeroed_scalar_gpu) {
     constexpr int BM = 128;
     constexpr int BN = 256;
     constexpr int BK = 64;
