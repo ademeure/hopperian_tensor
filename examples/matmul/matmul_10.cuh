@@ -1,12 +1,7 @@
 namespace M10 {
 
-constexpr int NUM_SM = 128;
-constexpr int TM = 8;
-constexpr int TN = 8;
-
-constexpr bool L2_SPLIT_M = true; // split M or N
-constexpr int L2_SIDES = 1;
-
+constexpr bool hybrid_cluster_sizes = true;
+constexpr int supertile_sync_tolerance = -1;
 constexpr int post_process_iterations = 8;
 constexpr int write_iterations = 2;
 constexpr int unrolled_iterations = post_process_iterations + write_iterations;
@@ -209,13 +204,14 @@ struct Schedule<1, BM, BN, TM, TN, M_MULT> {
     int super_tile_id;
     int num_super_tiles, num_super_n;
     int local_pos_m, local_pos_n;
+    int total_blocks_m, total_blocks_n;
 
     __device__ __forceinline__ Schedule(int M, int N, int _block) {
         super_tile_id = 0;
         local_pos_m = _block % TN;
         local_pos_n = _block / TN;
-        int total_blocks_m = CEIL_DIV(M, BM);
-        int total_blocks_n = CEIL_DIV(N, BN);
+        total_blocks_m = CEIL_DIV(M, BM);
+        total_blocks_n = CEIL_DIV(N, BN);
 
         num_super_n = total_blocks_n / TN;
         num_super_tiles = (total_blocks_m*total_blocks_n) / (TM*TN);
@@ -228,8 +224,12 @@ struct Schedule<1, BM, BN, TM, TN, M_MULT> {
     __device__ __forceinline__ bool next(int &block_m, int& block_n) {
         if (super_tile_id >= num_super_tiles) { return false; }
 
-        block_m = TM*(super_tile_id / num_super_n) + local_pos_m;
+        int m_super_pos = super_tile_id / num_super_n;
+        block_m = TM * m_super_pos + local_pos_m;
         block_n = TN*(super_tile_id % num_super_n) + local_pos_n;
+        if (m_super_pos % 2 != 0) {
+            block_n = total_blocks_n - block_n - 1;
+        }
 
         block_m *= M_MULT;
         ++super_tile_id;
@@ -290,7 +290,7 @@ __device__ void output_postprocess(int i, floatP d_x16[256/16][8], int idx_32b_b
 }
 
 template<int BM, int BN, int BK, int NUM_THREADS, int QSIZE, int CLUSTERS, bool RELU=false, bool SQUARED=false>
-__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, floatP* C, floatP* D, const __grid_constant__ CUtensorMap tensorMapI, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counters_zeroed, unsigned int* gpu_l2_sides, int base_pos, int num_sm, int total_clusters) {
+__global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1) matmulKernel10(int M, int N, int K, floatP* C, floatP* D, const __grid_constant__ CUtensorMap tensorMapI, const __grid_constant__ CUtensorMap tensorMapA, const __grid_constant__ CUtensorMap tensorMapB, unsigned int* counters_zeroed, int base_pos, int num_sm) {
     constexpr int MULTIPLE_EVERY_DIMENSON = 256;
     constexpr int MINIMUM_K_ITERATIONS = MULTIPLE_EVERY_DIMENSON / BK;
     constexpr int num_consumers = (NUM_THREADS / 128) - 1; // == 2
@@ -303,32 +303,12 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
     int wg_idx = threadIdx.x / 128;
     int tid = threadIdx.x % 128;
-    int l2_side = gpu_l2_sides[smid];
 
     // trick to make sure compiler knows this is uniform for a given warp
     // TODO: check if this is necessary for these specific variables (you'd hope the compiler was smart enough but...)
     wg_idx = __shfl_sync(0xffffffff, wg_idx, 0);
     cluster_id = __shfl_sync(0xffffffff, cluster_id, 0);
     cluster_rank = __shfl_sync(0xffffffff, cluster_rank, 0);
-    l2_side = __shfl_sync(0xffffffff, l2_side, 0);
-
-    int effective_cluster_id = cluster_id * (CLUSTERS / 2) + base_pos;
-    if (threadIdx.x == 0 && cluster_rank == 0) {
-        int num_clusters; // nclusterid
-        asm volatile("mov.u32 %0, %nclusterid.x;\n" : "=r"(num_clusters) :);
-        int add = 1 + (l2_side ? 1048576 : 1024) * (CLUSTERS / 2);
-        unsigned int val = atomicAdd(&counters_zeroed[1], add);
-        if ((val & 255) == total_clusters-1) {
-            counters_zeroed[1] = 0;
-        }
-
-        effective_cluster_id = (val >> (l2_side ? 20 : 10)) & 1023;
-        if (effective_cluster_id >= 32) {
-            effective_cluster_id = 9999999;
-        }
-        //printf("effective_cluster_id: %d (val: %d, val&255: %d, l2_side: %d, base_pos: %d)\n", effective_cluster_id, val, val&255, l2_side, base_pos);
-        effective_cluster_id += l2_side * 32;
-    }
 
     // ------------------------------------------------------------------------------------------------
     extern __shared__ __align__(128) uint8_t smem[];
@@ -355,7 +335,11 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     bool schedule_next;
     
     // ------------------------------------------------------------------------------------------------
-    // Producer
+    // Control Warpgroup
+    // Warp 0: Dynamic Scheduling (legacy, doesn't really need to be split anymore...)
+    // Warp 1: Producer via TMA (+specialised copy-paste for cluster rank 0 doing multicast)
+    // Warp 2: Updates regular barriers based on mbarrier status when producer data is ready
+    // (using regular barriers was slightly faster at one point, but it might no longer be true!)
     if (wg_idx == 0) {
         // 24 because it is impossible to allocate all 512 registers using 3 warps per sub-core...
         // 168*3 = 504, so we "lose" 8 registers per sub-core! *sigh*
@@ -364,6 +348,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
         int p = 0, qidx = 0;
 
         if (threadIdx.x == 0) {
+            // dynamic scheduling, writing next tile m/n to shared memory for entire cluster
+            // this is completely useless now because we no longer actually do dynamic scheduling...
+            // but keeping it because it looks cool (aka: deadlocked when tried removing & I gave up)
             for (int i = 0; i < QSIZE; ++i) {
                 init_barrier(&full[i], 1);
                 init_barrier(&empty[i], num_consumers*CLUSTERS);
@@ -371,8 +358,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             init_barrier(absmax_barrier, num_consumers*CLUSTERS);
 
             if (cluster_rank == 0) {
-                
-                Schedule<1, 256, 256, TM, TN, 2> schedule(M, N, effective_cluster_id);
+                Schedule<1, 256, 256, 8, 8, 2> schedule(M, N, cluster_id * (CLUSTERS / 2) + base_pos);
                 schedule_next = schedule.next(block_m, block_n);
 
                 ushort4* tileinfo_ptr[CLUSTERS];
@@ -402,6 +388,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
             bool first = true;
             int previous_m = -1, previous_n = -1;
 
+            // specialised so that one branch does multicast for B
+            // and the other doesn't load B at all (without conditionals)
+            // arguably overkill (but that's the name of the game?)
             if (cluster_rank == 0) {
                 constexpr uint32_t multicast_mask = (1 << CLUSTERS) - 1;
                 while (schedule_next) {
@@ -425,10 +414,16 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     first = false, previous_m = block_m, previous_n = block_n;
                     block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
 
-                    if (atomicInc(counters_zeroed, num_sm-1) < num_sm-1) {
-                        do {
-                            __nanosleep(32);
-                        } while (atomicCAS(counters_zeroed, 1<<20, 0) != 0);
+                    // supertile sync looks to be less beneficial with larger/hybrid cluster sizes
+                    // keeping it because it feels safer, and necessary if we had e.g. another kernel running in parallel...
+                    if constexpr (supertile_sync_tolerance >= 0) {
+                        if (atomicInc(counters_zeroed, num_sm-1) < num_sm - supertile_sync_tolerance - 1) {
+                            do {
+                                __nanosleep(32);
+                                int val = atomicCAS(counters_zeroed, 1<<20, 0);
+                                if (val == 0 || val >= num_sm - supertile_sync_tolerance) break;
+                            } while (true);
+                        }
                     }
                 }
             } else {
@@ -441,6 +436,7 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                         for (int j = 0; j < MINIMUM_K_ITERATIONS; j++, block_k_iter++) {
                             wait(EMPTY_PTR(qidx), p);
                             expect_bytes(FULL_PTR(qidx), (BK*BN+BK*BM)*sizeof(floatX));
+                            // no multicast! amazing... kinda.
                             load_async(SA_PTR(qidx), &tensorMapA, FULL_PTR(qidx), block_k_iter*BK, block_m*BM);
                             if (++qidx == QSIZE) { qidx = 0; p ^= 1;}
                             __nanosleep(128);
@@ -450,10 +446,14 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                     first = false, previous_m = block_m, previous_n = block_n;
                     block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
 
-                    if (atomicInc(counters_zeroed, num_sm-1) < num_sm-1) {
-                        do {
-                            __nanosleep(32);
-                        } while (atomicCAS(counters_zeroed, 1<<20, 0) != 0);
+                    if constexpr (supertile_sync_tolerance >= 0) {
+                        if (atomicInc(counters_zeroed, num_sm-1) < num_sm - supertile_sync_tolerance - 1) {
+                            do {
+                                __nanosleep(32);
+                                int val = atomicCAS(counters_zeroed, 1<<20, 0);
+                                if (val == 0 || val >= num_sm - supertile_sync_tolerance) break;
+                            } while (true);
+                        }
                     }
                 }
             }
@@ -616,8 +616,10 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
     asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
 }
 
+// not currently used as it didn't give any benefit with larger clusters :(
+// in theory could help improve L2 cache hit rate for A or B matrix
 template<int MAX_SM=256>
-__global__ void check_l2_latency(unsigned int* data) {
+__global__ void l2_side_per_sm(unsigned int* data) {
     if (threadIdx.x == 0) {
         int smid;
         asm volatile("mov.u32 %0, %smid;\n" : "=r"(smid) :);
@@ -648,33 +650,22 @@ void runKernel10(int M, int N, int K, floatX *A, floatX *B, floatP *C, floatP *I
     constexpr int BN = 256;
     constexpr int BK = sizeof(floatX) == 1 ? 128 : 64;
     constexpr int NUM_THREADS = 128*3;
-    constexpr int QSIZE = 4;
-    assert(K >= 8 * BK); // TODO: why was this???
+    constexpr int QSIZE = 4; // now only works with 2 or 4
 
     int num_sm;
     cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, 0);
-    assert(num_sm <= NUM_SM && num_sm <= 256);
-
     static unsigned int* gpu_l2_sides = nullptr;
-    if (gpu_l2_sides == nullptr) {
-        cudaMalloc(&gpu_l2_sides, 2 * 256 * sizeof(int));
-        cudaMemset(gpu_l2_sides, 0, 2 * 256 * sizeof(int));
-        check_l2_latency<256><<<num_sm, 128>>>(gpu_l2_sides);
-    }
-
     static cudaStream_t stream_2x, stream_8x;
-    static bool init_persistence = true;
-    if (init_persistence) {
-        init_persistence = false;
+    static bool init_misc = true;
+    if (init_misc) {
+        init_misc = false;
         cudaStreamCreate(&stream_2x);
         cudaStreamCreate(&stream_8x);
-/*
-        int device_id = 0;
-        cudaDeviceProp prop;                                                                        // CUDA device properties variable
-        cudaGetDeviceProperties(&prop, device_id);                                                  // Query GPU properties
-        size_t size = min(int(prop.l2CacheSize * 0.75) , prop.persistingL2CacheMaxSize);
-        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, size);                                   // set-aside 3/4 of L2 cache for persisting accesses or the max allowed
-*/
+
+        // not currently used, no benefit when combined with larger/hybrid cluster sizes
+        //cudaMalloc(&gpu_l2_sides, 2 * 256 * sizeof(int));
+        //cudaMemset(gpu_l2_sides, 0, 2 * 256 * sizeof(int));
+        //l2_side_per_sm<256><<<num_sm, 128>>>(gpu_l2_sides);
     }
 
     if (_prev_m != M || _prev_n != N || _prev_k != K) {
@@ -714,8 +705,13 @@ void runKernel10(int M, int N, int K, floatX *A, floatX *B, floatP *C, floatP *I
     cudaCheck(cudaFuncSetAttribute(kernel_2x, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
     cudaCheck(cudaFuncSetAttribute(kernel_8x, cudaFuncAttributeMaxDynamicSharedMemorySize, sMemSize));
 
-    kernel_8x<<<120, NUM_THREADS, sMemSize, stream_8x>>>(M, N, K, C, I, d_tma_map_I, d_tma_map_A, d_tma_map_B, zeroed_metadata_gpu, gpu_l2_sides, 0, NUM_SM, 21);
-    kernel_2x<<<12, NUM_THREADS, sMemSize, stream_2x>>>(M, N, K, C, I, d_tma_map_I, d_tma_map_A, d_tma_map_B, zeroed_metadata_gpu, gpu_l2_sides,  60, NUM_SM, 21);
+    assert(num_sm >= 128);
+    if constexpr (hybrid_cluster_sizes) {
+        kernel_8x<<<120, NUM_THREADS, sMemSize, stream_8x>>>(M, N, K, C, I, d_tma_map_I, d_tma_map_A, d_tma_map_B, zeroed_metadata_gpu, 0, 128);
+        kernel_2x<<<8, NUM_THREADS, sMemSize, stream_2x>>>(M, N, K, C, I, d_tma_map_I, d_tma_map_A, d_tma_map_B, zeroed_metadata_gpu,  60, 128);
+    } else {
+        kernel_2x<<<128, NUM_THREADS, sMemSize, stream_2x>>>(M, N, K, C, I, d_tma_map_I, d_tma_map_A, d_tma_map_B, zeroed_metadata_gpu,  0, 128);
+    }
 
     cudaCheck(cudaDeviceSynchronize());
 }
