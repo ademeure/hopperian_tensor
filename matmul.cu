@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <assert.h>
 
+// FP8 support without scaling (cuBLAS reference remains BF16)
 //#define FP8
 
 #ifdef FP8
@@ -34,10 +35,10 @@ constexpr bool REDUCE_SHARED_CONFLICTS = true;
 #define ENABLE_TRUE_RANDOM
 #define SLEEP_BETWEEN_KERNELS_SEC 0 // optional rest to avoid thermal throttling between kernels
 constexpr bool RUN_VERIF = true;
-constexpr int metadata_size = 16384; // big enough so it's spread over both L2 sides
+constexpr int metadata_size = 16384; // not currently used for more than a few counters etc.
 constexpr int max_size = 16384;
 constexpr int prime = 3719;
-int repeat_times = 400;
+int repeat_times = 1000;
 
 int get_time() {
   static int last_time = 0;
@@ -144,14 +145,13 @@ __global__ void verify_matrix_kernel(floatP *matRef, floatP *matOut, floatP *mat
       // (hack) accept result if it looks like RELU
       if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f) {
         if (diff > MAX_DIFF_ABS && ((float)ref_with_added / (float)matOut[i] > MAX_DIFF_REL || (float)ref_with_added / (float)matOut[i] < (1.0f/MAX_DIFF_REL))) {
-          if(!*error) {
+          int old_error = atomicExch(error, 1);
+          if(!old_error) {
             printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d\n", ref_with_added, (float)matOut[i], diff, i);
             *error = 1;
           }
         }
       }
-    } else if (i < 140) {
-      //: %5.20f, Is %5.20f (Diff %5.7f) at %d\n", ref_with_added, (float)matOut[i], diff, i);
     }
   }
 }
@@ -221,8 +221,7 @@ int main() {
   float elapsed_time;
 
   bool first_run = true;
-  bool run_verif = RUN_VERIF;
-  for (int kernel_num : {10, 10, 10, 10, 10, 10, 10, 0, 0}) {
+  for (int kernel_num : {10, 10, 10, 10, 10, 10, 0, 0, 0, 0, 0}) {
     printf("\nKERNEL %d\n", kernel_num);
 
     if (!first_run && SLEEP_BETWEEN_KERNELS_SEC) {
@@ -232,7 +231,7 @@ int main() {
 
 #ifdef ENABLE_CUBLAS
     // Verify against cuBLAS. Also serves as a warmup step
-    if (run_verif) {
+    if (RUN_VERIF) {
       cudaCheck(cudaMemset(dC, 0, sizeof(floatP) * m * n));
       cudaCheck(cudaMemset(dC_ref, 0, sizeof(floatP) * m * n));
       cudaCheck(cudaMemset(metadata_gpu, 0, metadata_size));

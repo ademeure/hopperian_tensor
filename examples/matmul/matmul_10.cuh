@@ -1,9 +1,9 @@
 namespace M10 {
 
-constexpr bool hybrid_cluster_sizes = true;
-constexpr int supertile_sync_tolerance = -1;
-constexpr int post_process_iterations = 8;
-constexpr int write_iterations = 2;
+constexpr bool hybrid_cluster_sizes = true; // hybrid of 8-wide + 2-wide clusters, see README.md
+constexpr int supertile_sync_tolerance = -1; // to force supertile to be in sync (overhead vs cache locality)
+constexpr int post_process_iterations = 8; // iterations used for transposing previous output (+elementwise?)
+constexpr int write_iterations = 2; // iterations used for writing output (of previous tile) to global memory
 constexpr int unrolled_iterations = post_process_iterations + write_iterations;
 
 CUtensorMap d_tma_map_A, d_tma_map_B, d_tma_map_C, d_tma_map_I;
@@ -143,16 +143,6 @@ __device__ static void load_async(uint32_t dst_ptr, void const* src_tma_map, uin
         " [%0], [%1, {%3, %4, %5}], [%2];\n"
         :: "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx/(128/(int)sizeof(T))) : "memory"
     );
-
-/*
-    asm volatile (
-        "{ .reg .b64 policy;\n"
-        "createpolicy.fractional.L2::evict_last.L2::evict_unchanged.b64  policy, 0.25;\n"
-        "cp.async.bulk.tensor.3d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.L2::cache_hint"
-        " [%0], [%1, {%3, %4, %5}], [%2], policy; }\n"
-        :: "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx/(128/(int)sizeof(T))) : "memory"
-    );
-*/
 }
 
 __device__ static inline void load_async_multicast(uint32_t dst_ptr, void const* src_tma_map, uint32_t mbar_ptr, int global_col_idx, int global_row_idx, uint16_t cluster_mask) {
@@ -228,6 +218,9 @@ struct Schedule<1, BM, BN, TM, TN, M_MULT> {
         block_m = TM * m_super_pos + local_pos_m;
         block_n = TN*(super_tile_id % num_super_n) + local_pos_n;
         if (m_super_pos % 2 != 0) {
+            // go in reverse to slightly improve cache locality
+            // without the complexity / SM count dependence of hilbert curves
+            // (useful for testing, but not actually as good for small sizes...)
             block_n = total_blocks_n - block_n - 1;
         }
 
@@ -458,6 +451,9 @@ __global__  __launch_bounds__(NUM_THREADS) void  __cluster_dims__(CLUSTERS, 1, 1
                 }
             }
         } else if (threadIdx.x == 64) {
+            // turns wait(FULL_PTR(qidx)) into regular barriers for consumers to wait on
+            // slightly more efficient(???) and fewer SASS instructions in the consumers
+            // no longer relevant on Blackwell since MMA is issued from single thread...
             asm volatile("barrier.cluster.arrive; barrier.cluster.wait; \n" ::);
             ushort4 tileinfo = s.tileinfo[0];
             block_m = tileinfo.x + cluster_rank, block_n = tileinfo.y, schedule_next = tileinfo.z;
@@ -662,7 +658,7 @@ void runKernel10(int M, int N, int K, floatX *A, floatX *B, floatP *C, floatP *I
         cudaStreamCreate(&stream_2x);
         cudaStreamCreate(&stream_8x);
 
-        // not currently used, no benefit when combined with larger/hybrid cluster sizes
+        // not currently used, no benefit when combined with larger/hybrid cluster sizes? :(
         //cudaMalloc(&gpu_l2_sides, 2 * 256 * sizeof(int));
         //cudaMemset(gpu_l2_sides, 0, 2 * 256 * sizeof(int));
         //l2_side_per_sm<256><<<num_sm, 128>>>(gpu_l2_sides);
