@@ -1,6 +1,6 @@
 NVCC_FLAGS = -std=c++17 -O3 -DNDEBUG -w
 NVCC_LDFLAGS = -lcublas -lcuda
-NVCC_INCLUDES = -I/usr/local/cuda-12.6/include
+NVCC_INCLUDES = -I/usr/local/cuda-12.8/include
 NVCC_LDLIBS =
 NCLL_INCUDES =
 OUT_DIR = out

@@ -4,7 +4,7 @@
 #include <cuda_bf16.h>
 #include <assert.h>
 
-#define FP8
+//#define FP8
 
 #ifdef FP8
 #include <cuda_fp8.h>
@@ -27,16 +27,17 @@ constexpr auto CU_TENSOR_FLOATP = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
 
 constexpr bool ENABLE_C_INPUT = false;
 constexpr float ENABLE_ABSMAX_SCALING = 0.0f;
-constexpr bool AVOID_SHARED_CONFLICTS = false;
+constexpr bool REDUCE_SHARED_CONFLICTS = true;
 
 #define ENABLE_CUBLAS
 #define ENABLE_RANDOM
 #define ENABLE_TRUE_RANDOM
-#define SLEEP_BETWEEN_KERNELS_SEC 1 // optional rest to avoid thermal throttling between kernels
+#define SLEEP_BETWEEN_KERNELS_SEC 0 // optional rest to avoid thermal throttling between kernels
 constexpr bool RUN_VERIF = true;
+constexpr int metadata_size = 16384; // big enough so it's spread over both L2 sides
 constexpr int max_size = 16384;
 constexpr int prime = 3719;
-int repeat_times = 128;
+int repeat_times = 400;
 
 int get_time() {
   static int last_time = 0;
@@ -83,7 +84,7 @@ void runCublasGemmBF16(int M, int N, int K, floatP *A, floatP *B, floatP *C) {
 }
 #endif
 
-void run_kernel(int kernel_num, int M, int N, int K, floatX *A, floatX *B, floatP *C, floatP *I, unsigned int* scalar_gpu) {
+void run_kernel(int kernel_num, int M, int N, int K, floatX *A, floatX *B, floatP *C, floatP *I, unsigned int* metadata_gpu) {
   switch (kernel_num) {
     case 0:
 #ifdef ENABLE_CUBLAS
@@ -91,7 +92,7 @@ void run_kernel(int kernel_num, int M, int N, int K, floatX *A, floatX *B, float
 #endif
       break;
     case 10:
-      runKernel10(M, N, K, A, B, C, I, scalar_gpu);
+      runKernel10(M, N, K, A, B, C, I, metadata_gpu);
       break;
   }
 }
@@ -129,41 +130,8 @@ void randomize_matrix(floatP *mat, int N, float scale=1.0f) {
 #endif
 }
 
-/*
-bool verify_matrix(floatP *matRef, floatP *matOut, int N) {
-  double diff = 0.0;
-  int i;
-  for (i = 0; i < N; i++) {
-    int r = i / 8192, c = i % 8192;
-    int it = c*8192+r;
-    diff = std::fabs(__bfloat162float(matRef[i] - matOut[i]));
-    if (diff > 0.1) {
-      printf("Divergence! Should %5.2f, Is %5.2f (Diff %5.2f) at %d\n",
-      __bfloat162float(matRef[i]), __bfloat162float(matOut[i]), diff, i);
-      return false;
-    }
-  }
-  return true;
-}
-*/
-
 __global__ void verify_matrix_kernel(floatP *matRef, floatP *matOut, floatP *matI, unsigned int *error, size_t N) {
   size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-
-/*
-  if (i == 0) {
-    for(int i = 0; i < 2048; i++) {
-      float diff = fabs((float)matRef[i] - (float)matOut[i]);
-      float ref = (float)matRef[i];
-      float out = (float)matOut[i];
-      float added = (float)matOut[i] + (float)matI[i];
-      float added_ref = (float)matRef[i] + (float)matI[i];
-      float value_I = (float)(matI[i]);
-      printf("Should be %5.20f, Is %5.20f (Diff %5.7f) at %d (with I: %5.7f ==> real diff: %5.7f)\n", ref, out, diff, i, value_I, added_ref - out);
-    }
-    return;
-  }
-*/
 
   if (i < N) {
     float ref_with_added = (float)((floatP)(((float)matRef[i] + (float)(ENABLE_C_INPUT ? (float)matI[i] : 0.0f))));
@@ -171,38 +139,19 @@ __global__ void verify_matrix_kernel(floatP *matRef, floatP *matOut, floatP *mat
 
     int x_base = i % max_size;
     int y_base = (i / max_size);
-    bool absmax_position = ENABLE_ABSMAX_SCALING ? (x_base % 256 == 0 && y_base % 256 == 0) : false;
 
-    if (diff > 0.1 || absmax_position) {
-      // accept result if it looks like RELU
-      if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f || absmax_position) {
-        //printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d (with I: %5.7f)\n", ref_with_added, (float)matOut[i], diff, (int)i, (float)matI[i]);
-        if (absmax_position) {
-          // calculate absmax for the tile
-          // (this is... not maximally efficient)
-          float absmax = 0.0f;
-          for (int x = 0; x < 256; x++) {
-            for (int y = 0; y < 256; y++) {
-              int idx = (x + x_base) + (y + y_base) * max_size;
-              float ref_with_added = (float)((floatP)(((float)matRef[idx] + (float)(ENABLE_C_INPUT ? (float)matI[idx] : 0.0f))));
-              absmax = max(absmax, fabsf(ref_with_added));
-            }
-          }
-          floatP absmax_bf16 = (floatP)absmax;
-          diff = fabsf((float)absmax_bf16 - (float)matOut[i]);
-          if (diff > 2.0) {
-            printf("absmax: %5.20f vs claimed_absmax: %5.20f (at: %d/%d)\n", (float)absmax_bf16, (float)matOut[i], (int)x_base, (int)y_base);
-            *error = 1;
-          }
-        } else {
-          if (diff > MAX_DIFF_ABS && ((float)ref_with_added / (float)matOut[i] > MAX_DIFF_REL || (float)ref_with_added / (float)matOut[i] < (1.0f/MAX_DIFF_REL))) {
+    if (diff > 0.1) {
+      // (hack) accept result if it looks like RELU
+      if ((float)matRef[i] > 0.0f || (float)matOut[i] != 0.0f) {
+        if (diff > MAX_DIFF_ABS && ((float)ref_with_added / (float)matOut[i] > MAX_DIFF_REL || (float)ref_with_added / (float)matOut[i] < (1.0f/MAX_DIFF_REL))) {
+          if(!*error) {
             printf("Divergence! Should %5.20f, Is %5.20f (Diff %5.7f) at %d\n", ref_with_added, (float)matOut[i], diff, i);
             *error = 1;
           }
         }
       }
-    } else {
-      //printf("OK! Should %5.20f, Is %5.20f (Diff %5.7f) at %d\n", ref_with_added, (float)matOut[i], diff, i);
+    } else if (i < 140) {
+      //: %5.20f, Is %5.20f (Diff %5.7f) at %d\n", ref_with_added, (float)matOut[i], diff, i);
     }
   }
 }
@@ -233,10 +182,10 @@ int main() {
   randomize_matrix(B, n * k);
   randomize_matrix(I, m * n, 0.0f);
 
-  unsigned int* scalar_gpu;
+  unsigned int* metadata_gpu;
   unsigned int scalar_host;
-  cudaMalloc((void**)&scalar_gpu, sizeof(unsigned int));
-  cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
+  cudaMalloc((void**)&metadata_gpu, metadata_size);
+  cudaCheck(cudaMemset(metadata_gpu, 0, metadata_size));
   cudaCheck(cudaMalloc((void **)&dA, sizeof(floatP) * m * k));
   cudaCheck(cudaMalloc((void **)&dB, sizeof(floatP) * n * k));
   cudaCheck(cudaMalloc((void **)&dC, sizeof(floatP) * m * n));
@@ -273,10 +222,10 @@ int main() {
 
   bool first_run = true;
   bool run_verif = RUN_VERIF;
-  for (int kernel_num : {10}) {
+  for (int kernel_num : {10, 10, 10, 10, 10, 10, 10, 0, 0}) {
     printf("\nKERNEL %d\n", kernel_num);
 
-    if (!first_run) {
+    if (!first_run && SLEEP_BETWEEN_KERNELS_SEC) {
       nanosleep(&ts_second, NULL); // optional rest to avoid thermal throttling between kernels
     }
     first_run = false;
@@ -286,14 +235,14 @@ int main() {
     if (run_verif) {
       cudaCheck(cudaMemset(dC, 0, sizeof(floatP) * m * n));
       cudaCheck(cudaMemset(dC_ref, 0, sizeof(floatP) * m * n));
-      cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
+      cudaCheck(cudaMemset(metadata_gpu, 0, metadata_size));
 
-      run_kernel(kernel_num, m, n, k, dA_X, dB_X, dC, dI, scalar_gpu);
+      run_kernel(kernel_num, m, n, k, dA_X, dB_X, dC, dI, metadata_gpu);
       runCublasGemmBF16(m, n, k, dA, dB, dC_ref);
 
-      cudaCheck(cudaMemset(scalar_gpu, 0, sizeof(unsigned int)));
-      verify_matrix_kernel<<<CEIL_DIV(m * n, 1024), 1024>>>(dC_ref, dC, dI, scalar_gpu, m * n);
-      cudaMemcpy(&scalar_host, scalar_gpu, sizeof(unsigned int), cudaMemcpyDeviceToHost); // can only be async because next memcpy isn't
+      cudaCheck(cudaMemset(metadata_gpu, 0, metadata_size));
+      verify_matrix_kernel<<<CEIL_DIV(m * n, 1024), 1024>>>(dC_ref, dC, dI, metadata_gpu, m * n);
+      cudaMemcpy(&scalar_host, metadata_gpu, sizeof(unsigned int), cudaMemcpyDeviceToHost); // can only be async because next memcpy isn't
       printf("\n=======> Kernel %d -> VERIFICATION: %s\n\n", kernel_num, scalar_host ? "!!!!! FAILED !!!!!" : "OK");
     }
 #endif
@@ -303,7 +252,7 @@ int main() {
     // Benchmark
     cudaEventRecord(start);
     for (int j = 0; j < repeat_times; j++) {
-      run_kernel(kernel_num, m, n, k, dA_X, dB_X, dC, dI, scalar_gpu);
+      run_kernel(kernel_num, m, n, k, dA_X, dB_X, dC, dI, metadata_gpu);
     }
     cudaEventRecord(stop);
     cudaEventSynchronize(start);
@@ -330,6 +279,6 @@ int main() {
   cudaFree(dB_X);
   cudaFree(dC_X);
   cudaFree(dI_X);
-  cudaFree(scalar_gpu);
+  cudaFree(metadata_gpu);
   return 0;
 };
